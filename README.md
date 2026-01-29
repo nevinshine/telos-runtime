@@ -174,5 +174,5 @@ If you use Telos in your research, please cite:
 }
 ```
 
-**Author:** Nevin
+**Author:** Nevin Shine
 **Role:** Systems Security Research Engineer
