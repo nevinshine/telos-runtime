@@ -1,0 +1,28 @@
+# Build Artifacts
+bin/
+build/
+*.o
+*.test
+__pycache__/
+*.pyc
+*.exe
+
+# eBPF Generated
+vmlinux.h
+*_bpf.o
+*_bpf.go
+
+# Credentials & Secrets
+.env
+*.pem
+*.key
+id_rsa
+secrets/
+
+# IDE Configs
+.vscode/
+.idea/
+*.swp
+
+# Docker
+docker-compose.override.yml

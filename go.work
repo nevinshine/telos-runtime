@@ -1,0 +1,6 @@
+go 1.22
+
+use (
+    ./telos_core/loader
+    ./telos_edge/loader
+)
