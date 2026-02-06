@@ -1,4 +1,5 @@
 # TELOS Runtime
+> **v1.0 (Milestone 1)** - Browser-to-Kernel AI Security Bridge
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Tech Stack](https://img.shields.io/badge/tech-eBPF%20%7C%20Go%20%7C%20Python-blue)
