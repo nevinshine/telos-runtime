@@ -1,0 +1,9 @@
+{
+    "name": "com.telos.native",
+    "description": "Telos Security Runtime - Native Messaging Host",
+    "path": "/home/nevinshine/code/telos-runtime/browser_eye/native_host/host_messaging.py",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+    ]
+}

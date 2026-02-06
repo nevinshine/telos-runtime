@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Telos Browser Eye",
+  "description": "Teleological Enforcement Sensor - Detects DOM-based prompt injections",
+  "version": "0.1.0",
+  "permissions": [
+    "activeTab",
+    "nativeMessaging",
+    "scripting"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

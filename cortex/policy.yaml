@@ -1,0 +1,88 @@
+# Telos Cortex - Policy Configuration
+#
+# This file defines the default security policy for the Telos runtime.
+# All values can be overridden via environment variables or command-line flags.
+
+# === TAINT THRESHOLDS ===
+# Taint levels: CLEAN=0, LOW=1, MEDIUM=2, HIGH=3, CRITICAL=4
+
+taint:
+  # Maximum taint level before blocking execve() syscalls
+  max_taint_for_exec: 2  # MEDIUM - block HIGH and above
+  
+  # Maximum taint level before blocking network connections
+  max_taint_for_network: 3  # HIGH - block CRITICAL only for network
+  
+  # How long (seconds) before taint decays one level
+  decay_interval: 300  # 5 minutes
+
+# === AGENT SETTINGS ===
+agent:
+  # Automatically register processes matching these patterns
+  auto_register_patterns:
+    - "python3"
+    - "node"
+    - "agent"
+  
+  # Maximum number of concurrent agents
+  max_agents: 10
+
+# === NETWORK POLICY ===
+network:
+  # Default stance: deny all unless explicitly allowed
+  default_action: deny
+  
+  # Always allowed destinations (even when tainted)
+  always_allowed:
+    - "127.0.0.1"
+    - "::1"
+  
+  # Never allowed destinations (blocked regardless of taint)
+  blocked:
+    - "attacker.com"
+    - "evil.net"
+    - "*.onion"
+
+# === FILESYSTEM POLICY ===
+filesystem:
+  # Paths that are NEVER accessible to tainted processes
+  sensitive_paths:
+    - "/home/*/.ssh/*"
+    - "/home/*/.gnupg/*"
+    - "/home/*/.aws/*"
+    - "/etc/shadow"
+    - "/etc/passwd"
+  
+  # Paths always allowed (sandbox areas)
+  allowed_paths:
+    - "/tmp/telos/*"
+    - "/var/tmp/agent/*"
+
+# === DETECTION TUNING ===
+detection:
+  # Keywords that elevate taint to HIGH when found hidden
+  high_severity_keywords:
+    - "ignore previous"
+    - "system prompt"
+    - "you are now"
+    - "disregard"
+    - "new instructions"
+  
+  # Keywords that elevate taint to CRITICAL (possible attack)
+  critical_keywords:
+    - "curl"
+    - "wget"
+    - "exfiltrate"
+    - "ssh key"
+    - "id_rsa"
+    - "/etc/passwd"
+
+# === LOGGING ===
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  
+  # Log all taint events (for forensics)
+  audit_taints: true
+  
+  # Log all blocked operations
+  audit_blocks: true
