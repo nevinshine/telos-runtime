@@ -21,7 +21,8 @@
 #include <bpf/bpf_tracing.h>
 
 // Include shared definitions
-#include "../../shared/common_maps.h"
+#include "../maps/mirage_maps.h" // Phase 4 Active Deception
+#include "../maps/process_map.h"
 
 // EPERM is not available in BPF, define it
 #ifndef EPERM
@@ -35,7 +36,7 @@ char LICENSE[] SEC("license") = "GPL";
 
 // Process taint map: PID -> process_info_t
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct process_info_t);
@@ -70,6 +71,35 @@ struct {
   __uint(max_entries, 256 * 1024); // 256 KB
 } events SEC(".maps");
 
+// Inode policy map: Inode Number -> Sensitivity Level
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64); // Inode Number
+  __type(value, struct inode_policy_t);
+} inode_map SEC(".maps");
+
+// Network allowlist map: IPv4 Address -> Allowed
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u32); // IPv4 Address
+  __type(value, struct network_policy_t);
+} network_map SEC(".maps");
+
+// [Phase 5] Execution Allowlist map: PID -> exec_policy_t
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u32); // PID
+  __type(value, struct exec_policy_t);
+} exec_policy_map SEC(".maps");
+
+// Define AF_INET if missing
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+
 // === HELPER FUNCTIONS ===
 
 static __always_inline struct telos_config_t *get_config(void) {
@@ -91,7 +121,7 @@ static __always_inline void emit_event(__u32 pid, __u32 taint, __u32 blocked,
   bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
   // Copy action string (max 15 chars + null)
-  __builtin_memcpy(event->action, action, 7);
+  __builtin_memcpy(event->action, action, 15);
 
   bpf_ringbuf_submit(event, 0);
 }
@@ -101,9 +131,12 @@ static __always_inline void emit_event(__u32 pid, __u32 taint, __u32 blocked,
 /*
  * Hook: bprm_check_security
  *
+ * Phase 5: Intent-Based Execution Gate
+ *
  * Called before execve() is allowed to proceed.
- * This is the primary enforcement point - if a tainted process
- * tries to spawn a new program (e.g., curl, bash), we block it.
+ * Two-layer enforcement:
+ *   Layer 1: Taint check (legacy, catches compromised processes)
+ *   Layer 2: Intent-based allowlist (Phase 5, restricts binaries per-intent)
  *
  * IMPORTANT: We also check the PARENT's taint level, because when a
  * tainted process forks and execs, the child has a new PID that isn't
@@ -112,25 +145,23 @@ static __always_inline void emit_event(__u32 pid, __u32 taint, __u32 blocked,
 SEC("lsm/bprm_check_security")
 int BPF_PROG(telos_check_exec, struct linux_binprm *bprm) {
   __u32 pid = bpf_get_current_pid_tgid() >> 32;
-  struct process_info_t *info = NULL;
   __u32 effective_taint = TAINT_CLEAN;
+  struct process_info_t *info = NULL;
 
   // Get config
   struct telos_config_t *config = get_config();
   __u32 max_taint = config ? config->max_taint_for_exec : TAINT_MEDIUM;
   __u32 enforce = config ? config->enabled : 1;
 
-  // First, check if THIS process is tracked
+  // === Layer 1: Taint Check (Legacy Fallback) ===
   info = bpf_map_lookup_elem(&process_map, &pid);
   if (info) {
     effective_taint = info->taint_level;
   } else {
     // Not tracked directly - check PARENT process
-    // This catches forked children of tainted processes
     struct task_struct *current_task =
         (struct task_struct *)bpf_get_current_task();
     if (current_task) {
-      // Get parent's PID
       __u32 ppid = BPF_CORE_READ(current_task, real_parent, tgid);
       struct process_info_t *parent_info =
           bpf_map_lookup_elem(&process_map, &ppid);
@@ -142,11 +173,67 @@ int BPF_PROG(telos_check_exec, struct linux_binprm *bprm) {
 
   // Check if taint exceeds threshold
   if (effective_taint > max_taint) {
-    // Emit to ringbuf for userspace logging (lightweight)
-    emit_event(pid, effective_taint, 1, "execve");
-
+    emit_event(pid, effective_taint, 1, "exec_tainted");
     if (enforce) {
-      return -EPERM; // Permission denied
+      return -EPERM;
+    }
+  }
+
+  // === Layer 2: Intent-Based Execution Allowlist (Phase 5) ===
+  struct exec_policy_t *policy = bpf_map_lookup_elem(&exec_policy_map, &pid);
+
+  // Inheritance: If the child isn't tracked, lookup the parent's policy.
+  // This prevents attackers from bypassing the execution gate via fork/exec.
+  if (!policy) {
+    struct task_struct *current_task =
+        (struct task_struct *)bpf_get_current_task();
+    if (current_task) {
+      __u32 ppid = BPF_CORE_READ(current_task, real_parent, tgid);
+      policy = bpf_map_lookup_elem(&exec_policy_map, &ppid);
+    }
+  }
+
+  // If policy exists and is in enforce mode (1)
+  if (policy && policy->mode == 1) {
+    char filename[16] = {0};
+
+    // Extract binary name being executed
+    bpf_probe_read_kernel_str(
+        &filename, sizeof(filename),
+        BPF_CORE_READ(bprm, file, f_path.dentry, d_name.name));
+
+    bool matched = false;
+
+// BPF Verifier bounded loop checking up to 8 allowed binaries
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      if (policy->allowed_bins[i][0] == '\0') {
+        continue; // Empty slot
+      }
+
+      bool is_match = true;
+      for (int j = 0; j < 16; j++) {
+        if (filename[j] != policy->allowed_bins[i][j]) {
+          is_match = false;
+          break;
+        }
+        // If we reached the end of both strings simultaneously and they match
+        if (filename[j] == '\0') {
+          break;
+        }
+      }
+
+      if (is_match) {
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      emit_event(pid, effective_taint, 1, "exec_denied");
+      if (enforce) {
+        return -EPERM;
+      }
     }
   }
 
@@ -162,9 +249,20 @@ int BPF_PROG(telos_check_exec, struct linux_binprm *bprm) {
 SEC("lsm/file_open")
 int BPF_PROG(telos_check_file, struct file *file) {
   __u32 pid = bpf_get_current_pid_tgid() >> 32;
+  __u32 tracked_pid = pid;
 
   // Lookup process in taint map
-  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &tracked_pid);
+  if (!info) {
+    // Not tracked directly - check PARENT process
+    struct task_struct *current_task =
+        (struct task_struct *)bpf_get_current_task();
+    if (current_task) {
+      tracked_pid = BPF_CORE_READ(current_task, real_parent, tgid);
+      info = bpf_map_lookup_elem(&process_map, &tracked_pid);
+    }
+  }
+
   if (!info) {
     // Not a tracked process - allow
     return 0;
@@ -175,29 +273,44 @@ int BPF_PROG(telos_check_file, struct file *file) {
   __u32 max_taint = config ? config->max_taint_for_open : TAINT_HIGH;
   __u32 enforce = config ? config->enabled : 1;
 
-  // For now, we only block if taint is CRITICAL
-  // More granular file path checking would require more complex logic
-  if (info->taint_level >= TAINT_CRITICAL) {
-    // Get the dentry to check path
-    struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
-    if (!dentry)
-      return 0;
+  // Get the dentry to check inode
+  struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+  if (!dentry)
+    return 0;
 
-    // Read filename (limited capability in BPF)
-    char filename[32];
-    int ret = bpf_probe_read_kernel_str(&filename, sizeof(filename),
-                                        BPF_CORE_READ(dentry, d_name.name));
-    if (ret < 0)
-      return 0;
+  // Retrieve Inode Number
+  struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+  if (!inode)
+    return 0;
 
-    // Check for sensitive file patterns
-    // Note: This is a simplified check - real implementation would use
-    // a map of blocked paths
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
 
-    // Check for SSH keys
-    if (filename[0] == 'i' && filename[1] == 'd' && filename[2] == '_') {
-      // Matches id_* (id_rsa, id_ed25519, etc.)
-      emit_event(pid, info->taint_level, 1, "open");
+  // [MIRAGE HANDOFF] Check if this inode is slated for deception
+  if (info->taint_level >= max_taint) {
+    __u32 *honey_id = bpf_map_lookup_elem(&mirage_map, &ino);
+    if (honey_id) {
+      // Emit audit event but DO NOT BLOCK. Hand off to ksys_read interceptor.
+      emit_event(pid, info->taint_level, 0, "mirage_trap");
+      return 0; // ALLOW!
+    }
+  }
+
+  // Check Inode Map
+  struct inode_policy_t *policy = bpf_map_lookup_elem(&inode_map, &ino);
+  if (policy && policy->sensitivity > 0) {
+    // Phase 7: Data-Flow Taint Tracking (Dynamic IFC)
+    // If the process is currently clean but touches a highly sensitive file,
+    // we mutate its state in real-time.
+    if (policy->sensitivity >= 2 && info->taint_level < TAINT_CRITICAL) {
+      info->taint_level = TAINT_CRITICAL;
+      bpf_map_update_elem(&process_map, &tracked_pid, info, BPF_ANY);
+      emit_event(tracked_pid, info->taint_level, 0, "taint_elevate");
+    }
+
+    // Now enforce the policy against the mutated (or existing) taint level
+    if (info->taint_level >= max_taint) {
+      // Inode is sensitive!
+      emit_event(tracked_pid, info->taint_level, 1, "open_inode");
 
       if (enforce) {
         return -EPERM;
@@ -205,7 +318,99 @@ int BPF_PROG(telos_check_file, struct file *file) {
     }
   }
 
+  // Fallback: Filename check (Legacy / Defense in Depth)
+  if (info->taint_level >= max_taint) {
+    char filename[32];
+    int ret = bpf_probe_read_kernel_str(&filename, sizeof(filename),
+                                        BPF_CORE_READ(dentry, d_name.name));
+    if (ret >= 0) {
+      if (filename[0] == 'i' && filename[1] == 'd' && filename[2] == '_') {
+        emit_event(tracked_pid, info->taint_level, 1, "open_name");
+        if (enforce)
+          return -EPERM;
+      }
+    }
+  }
+
   return 0; // Allow
+}
+
+// Define AF_INET6 if missing from vmlinux.h or headers
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+/*
+ * Hook: socket_connect
+ *
+ * Control network connections. Tainted processes can only connect
+ * to explicitly whitelisted IPs.
+ */
+SEC("lsm/socket_connect")
+int BPF_PROG(telos_check_connect, struct socket *sock, struct sockaddr *address,
+             int addrlen) {
+  __u32 pid = bpf_get_current_pid_tgid() >> 32;
+  __u32 tracked_pid = pid;
+
+  // Lookup process
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &tracked_pid);
+  if (!info) {
+    // Not tracked directly - check PARENT process
+    struct task_struct *current_task =
+        (struct task_struct *)bpf_get_current_task();
+    if (current_task) {
+      tracked_pid = BPF_CORE_READ(current_task, real_parent, tgid);
+      info = bpf_map_lookup_elem(&process_map, &tracked_pid);
+    }
+  }
+
+  if (!info)
+    return 0; // Not tracked -> Allow daemon connections
+
+  // Get config
+  struct telos_config_t *config = get_config();
+  __u32 enforce = config ? config->enabled : 1;
+
+  // Phase 7: Dynamic Information Flow Control (IFC) Slam
+  // If the agent read a highly sensitive file, its taint was elevated to
+  // CRITICAL. We MUST instantly drop all network connections to prevent data
+  // exfiltration, regardless of what the AI explicitly allowed in the network
+  // map.
+  if (info->taint_level >= TAINT_CRITICAL) {
+    emit_event(tracked_pid, info->taint_level, 1, "exfil_blocked");
+    if (enforce) {
+      return -EPERM;
+    }
+  }
+
+  // 1. Blackhole IPv6 for tracked AI agents to prevent firewall bypass
+  if (address->sa_family == AF_INET6) {
+    emit_event(tracked_pid, info->taint_level, 1, "connect_ipv6_denied");
+    if (enforce) {
+      return -EPERM;
+    }
+  }
+
+  // 2. Allow local Unix sockets (IPC) and other non-IPv4 families
+  if (address->sa_family != AF_INET) {
+    return 0;
+  }
+
+  struct sockaddr_in *addr = (struct sockaddr_in *)address;
+  __u32 dest_ip = addr->sin_addr.s_addr;
+
+  // Check Allowlist
+  struct network_policy_t *policy = bpf_map_lookup_elem(&network_map, &dest_ip);
+  if (!policy || policy->allowed != 1) {
+    // Block! ALL tracked processes are blocked by default unless allowed.
+    emit_event(pid, info->taint_level, 1, "connect_denied");
+
+    if (enforce) {
+      return -EPERM;
+    }
+  }
+
+  return 0;
 }
 
 /*
@@ -231,3 +436,241 @@ int BPF_PROG(telos_task_alloc, struct task_struct *task,
 
   return 0; // Always allow fork (blocking happens at execve)
 }
+
+/*
+ * NEW Hook: ksys_read ENTRY
+ * Resolve FD -> Inode, check Mirage map, stash user buffer.
+ */
+SEC("kprobe/ksys_read")
+int BPF_KPROBE(mirage_read_enter, unsigned int fd, char *buf, size_t count) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 pid = pid_tgid >> 32;
+
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+  if (!info || info->taint_level < TAINT_HIGH)
+    return 0; // Only deceive tainted agents
+
+  // 1. Resolve FD to Inode using BPF CO-RE
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+  // Safety checks required by verifier for pointer walking
+  struct files_struct *files = BPF_CORE_READ(task, files);
+  if (!files)
+    return 0;
+
+  struct fdtable *fdt = BPF_CORE_READ(files, fdt);
+  if (!fdt || fd >= BPF_CORE_READ(fdt, max_fds))
+    return 0;
+
+  struct file **fd_array = BPF_CORE_READ(fdt, fd);
+  if (!fd_array)
+    return 0;
+
+  struct file *f = NULL;
+  bpf_probe_read_kernel(&f, sizeof(struct file *),
+                        &fd_array[fd]); // The actual struct file
+  if (!f)
+    return 0;
+
+  struct inode *inode = BPF_CORE_READ(f, f_inode);
+  if (!inode)
+    return 0;
+
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+
+  // 2. Check if Inode is in Mirage Map
+  __u32 *honey_id = bpf_map_lookup_elem(&mirage_map, &ino);
+  if (!honey_id)
+    return 0; // Normal file
+
+  // 3. Stash State for kretprobe
+  struct active_mirage_read_t state = {};
+  state.user_buf = (void *)buf;
+  state.requested_count = count;
+  state.honey_id = *honey_id;
+
+  bpf_map_update_elem(&active_mirage_reads, &pid_tgid, &state, BPF_ANY);
+  return 0;
+}
+
+/*
+ * NEW Hook: ksys_read EXIT
+ * Overwrite the buffer with the honey token.
+ */
+SEC("kretprobe/ksys_read")
+int BPF_KRETPROBE(mirage_read_exit) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  struct active_mirage_read_t *state =
+      bpf_map_lookup_elem(&active_mirage_reads, &pid_tgid);
+  if (!state)
+    return 0;
+
+  long bytes_read = PT_REGS_RC(ctx);
+
+  if (bytes_read > 0) {
+    struct honey_payload_t *payload =
+        bpf_map_lookup_elem(&honey_data_map, &state->honey_id);
+    if (payload) {
+      __u32 write_len = payload->length;
+
+      // Ensure write_len is bounded for the verifier
+      if (write_len > 256)
+        write_len = 256;
+
+      // Safety Truncation: Never write more than kernel read
+      if (bytes_read > 0 && bytes_read < 256) {
+        if (write_len > bytes_read) {
+          write_len = bytes_read;
+        }
+      }
+
+      // Hard-bound for BPF verifier using bitwise operations
+      write_len &= 0xFF; // Binds to [0, 255]
+
+      if (write_len > 0) {
+        long err =
+            bpf_probe_write_user(state->user_buf, payload->data, write_len);
+        if (err == 0) {
+          emit_event(pid_tgid >> 32, TAINT_CRITICAL, 0, "mirage_fed");
+        }
+      }
+    }
+  }
+
+  bpf_map_delete_elem(&active_mirage_reads, &pid_tgid);
+  return 0;
+}
+
+/*
+ * ==========================================
+ * PHASE 4: THE ILLUSIONIST (Metadata Spoofing)
+ * ==========================================
+ * Spoof stat.st_size for honey-files so `ls -l`
+ * and file buffers see the fake size, not the padded real size.
+ *
+ * We hook the syscall entries to grab the user `statbuf` pointer (safe for
+ * bpf_probe_write_user), and vfs_getattr (shared inner function) to verify
+ * the target inode against the Mirage Map.
+ */
+
+struct active_fstat_state_t {
+  void *statbuf;
+  __u32 honey_id;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u64); // PID/TID
+  __type(value, struct active_fstat_state_t);
+} active_fstats SEC(".maps");
+
+// 1A. Entry to newfstatat (handles stat, lstat, fstatat)
+SEC("kprobe/__x64_sys_newfstatat")
+int BPF_KPROBE(mirage_sys_newfstatat_enter, struct pt_regs *regs) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 pid = pid_tgid >> 32;
+
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+  if (!info || info->taint_level < TAINT_HIGH)
+    return 0; // Only deceive tainted agents
+
+  struct active_fstat_state_t state = {};
+
+  void *statbuf = NULL;
+  // The 3rd argument is struct stat __user *statbuf (dx register on x86_64)
+  // Safely read it using bpf_probe_read_kernel to satisfy the verifier
+  bpf_probe_read_kernel(&statbuf, sizeof(statbuf), &regs->dx);
+
+  state.statbuf = statbuf;
+  state.honey_id = 0; // Unknown until vfs_getattr resolves the inode
+
+  bpf_map_update_elem(&active_fstats, &pid_tgid, &state, BPF_ANY);
+  return 0;
+}
+
+// 1B. Entry to newfstat (handles fstat)
+SEC("kprobe/__x64_sys_newfstat")
+int BPF_KPROBE(mirage_sys_newfstat_enter, struct pt_regs *regs) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 pid = pid_tgid >> 32;
+
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+  if (!info || info->taint_level < TAINT_HIGH)
+    return 0;
+
+  struct active_fstat_state_t state = {};
+
+  void *statbuf = NULL;
+  // The 2nd argument is struct stat __user *statbuf (si register on x86_64)
+  bpf_probe_read_kernel(&statbuf, sizeof(statbuf), &regs->si);
+
+  state.statbuf = statbuf;
+  state.honey_id = 0;
+
+  bpf_map_update_elem(&active_fstats, &pid_tgid, &state, BPF_ANY);
+  return 0;
+}
+
+// 2. Inner lookup inside vfs_getattr to get the inode
+SEC("kprobe/vfs_getattr")
+int BPF_KPROBE(mirage_getattr_enter, const struct path *path,
+               struct kstat *stat) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  struct active_fstat_state_t *state =
+      bpf_map_lookup_elem(&active_fstats, &pid_tgid);
+  if (!state)
+    return 0; // Not inside a tracked stat syscall
+
+  struct dentry *dentry = BPF_CORE_READ(path, dentry);
+  if (!dentry)
+    return 0;
+  struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+  if (!inode)
+    return 0;
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+
+  // Check if Inode is in Mirage Map
+  __u32 *honey_id = bpf_map_lookup_elem(&mirage_map, &ino);
+  if (honey_id) {
+    state->honey_id = *honey_id; // Mark for spoofing!
+  }
+  return 0;
+}
+
+// Helper for Exits
+static __always_inline int mirage_fstat_exit(struct pt_regs *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  struct active_fstat_state_t *state =
+      bpf_map_lookup_elem(&active_fstats, &pid_tgid);
+  if (!state)
+    return 0;
+
+  int ret = PT_REGS_RC(ctx);
+  // If stat succeeded and it's a honey file
+  if (ret == 0 && state->honey_id != 0 && state->statbuf != NULL) {
+    struct honey_payload_t *payload =
+        bpf_map_lookup_elem(&honey_data_map, &state->honey_id);
+    if (payload) {
+      long fake_size = payload->length;
+      // bpf_probe_write_user is safe here because statbuf is a user pointer.
+      // Offset 48 is struct stat.st_size on x86_64
+      void *size_ptr = (void *)((char *)state->statbuf + 48);
+      bpf_probe_write_user(size_ptr, &fake_size, sizeof(fake_size));
+    }
+  }
+
+  bpf_map_delete_elem(&active_fstats, &pid_tgid);
+  return 0;
+}
+
+// 3A. Exit from newfstatat
+SEC("kretprobe/__x64_sys_newfstatat")
+int BPF_KRETPROBE(mirage_sys_newfstatat_exit) { return mirage_fstat_exit(ctx); }
+
+// 3B. Exit from newfstat
+SEC("kretprobe/__x64_sys_newfstat")
+int BPF_KRETPROBE(mirage_sys_newfstat_exit) { return mirage_fstat_exit(ctx); }

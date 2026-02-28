@@ -5,7 +5,7 @@ import warnings
 
 from shared import protocol_pb2 as shared_dot_protocol__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,8 +26,7 @@ if _version_not_supported:
 
 
 class TelosControlStub(object):
-    """The "Cortex" acts as the central server.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -53,26 +52,22 @@ class TelosControlStub(object):
 
 
 class TelosControlServicer(object):
-    """The "Cortex" acts as the central server.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def ReportTaint(self, request, context):
-        """1. Browser Eye reports finding hidden text/taint
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DeclareIntent(self, request, context):
-        """2. Agent declares what it wants to do (Intent)
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetPolicy(self, request, context):
-        """3. Daemons (Core/Edge) ask for latest rules
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -104,8 +99,7 @@ def add_TelosControlServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class TelosControl(object):
-    """The "Cortex" acts as the central server.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def ReportTaint(request,

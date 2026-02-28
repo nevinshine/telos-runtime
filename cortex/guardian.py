@@ -60,9 +60,21 @@ class Guardian:
         # View to Agent mapping: source_id -> PID
         self.view_agent_map: Dict[str, int] = {}
         
+        # Session ID mapping: session_id -> PID
+        self.session_map: Dict[str, int] = {}
+        
         log.info("Guardian initialized")
     
     # === AGENT REGISTRY ===
+
+    def register_session(self, session_id: str, pid: int) -> bool:
+        """Register a session ID for an agent."""
+        if not session_id:
+            return False
+            
+        self.session_map[session_id] = pid
+        log.info(f"Session mapped: {session_id[:8]}... -> PID {pid}")
+        return True
     
     def register_agent(self, pid: int) -> bool:
         """
@@ -88,6 +100,11 @@ class Guardian:
         
         del self.agents[pid]
         
+        # Clean session map
+        for sid, p in list(self.session_map.items()):
+            if p == pid:
+                del self.session_map[sid]
+        
         # Update active agent
         if self.active_agent_pid == pid:
             if self.agents:
@@ -105,7 +122,7 @@ class Guardian:
     
     # === TAINT MANAGEMENT ===
     
-    def update_taint(self, source_id: str, level: int, url: str = "") -> None:
+    def update_taint(self, source_id: str, level: int, url: str = "", session_id: str = "") -> None:
         """
         Update taint record for a browser view/source.
         
@@ -113,6 +130,7 @@ class Guardian:
             source_id: Browser tab/view identifier
             level: TaintLevel enum value (0-4)
             url: URL where taint was detected
+            session_id: Optional session ID from browser
         """
         self.taint_records[source_id] = TaintRecord(
             source_id=source_id,
@@ -121,7 +139,7 @@ class Guardian:
         )
         
         # Also update the associated agent's taint level
-        agent_pid = self.get_agent_pid_for_view(source_id)
+        agent_pid = self.get_agent_pid_for_view(source_id, session_id)
         if agent_pid and agent_pid in self.agents:
             # Agent's taint is the max of all their views
             current_max = self.agents[agent_pid].taint_level
@@ -143,23 +161,27 @@ class Guardian:
     
     # === PID BRIDGE ===
     
-    def get_agent_pid_for_view(self, source_id: str) -> Optional[int]:
+    def get_agent_pid_for_view(self, source_id: str, session_id: str = "") -> Optional[int]:
         """
         Resolve which agent PID should receive taint from a browser view.
         
-        Phase 2 Strategy (Simple):
-        1. If source_id is explicitly mapped, use that mapping
-        2. Otherwise, assume the active agent is viewing this source
-        
-        Phase 3+ Strategy:
-        - Use session IDs passed from agent to browser
-        - Track which agent opened which URLs
+        Strategy:
+        1. Check explicit session_id mapping (Phase 3)
+        2. Check explicit source_id mapping
+        3. Fall back to active agent (Phase 2 legacy)
         """
-        # Check explicit mapping first
+        # 1. Session ID (Strongest Link)
+        if session_id and session_id in self.session_map:
+            pid = self.session_map[session_id]
+            # Auto-map for future lookups without session_id
+            self.view_agent_map[source_id] = pid
+            return pid
+
+        # 2. Check explicit view mapping
         if source_id in self.view_agent_map:
             return self.view_agent_map[source_id]
         
-        # Fall back to active agent
+        # 3. Fall back to active agent (Migration/Legacy)
         if self.active_agent_pid:
             # Auto-map this view to the active agent
             self.view_agent_map[source_id] = self.active_agent_pid

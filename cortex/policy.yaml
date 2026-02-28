@@ -52,6 +52,7 @@ filesystem:
     - "/home/*/.aws/*"
     - "/etc/shadow"
     - "/etc/passwd"
+    - "/tmp/secret_file"
   
   # Paths always allowed (sandbox areas)
   allowed_paths:
@@ -86,3 +87,13 @@ logging:
   
   # Log all blocked operations
   audit_blocks: true
+
+# === MIRAGE (ACTIVE DECEPTION) ===
+mirage:
+  enabled: true
+  honey_files:
+    - path: "/tmp/secret.txt"
+      # Dynamic or static payload up to 256 bytes
+      payload: "[MIRAGE] AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+    - path: "/etc/passwd"
+      payload: "root:x:0:0:root:/root:/bin/bash\nsysadmin:x:999:999:System Admin:/home/sysadmin:/bin/false\n"

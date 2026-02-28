@@ -1,0 +1,17 @@
+[Unit]
+Description=Telos Cortex Intelligence Engine
+After=network.target telos-loader.service
+Requires=telos-loader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/nevinshine/code/telos-runtime
+Environment="PATH=/home/nevinshine/code/telos-runtime/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/nevinshine/code/telos-runtime/.venv/bin/python3 /home/nevinshine/code/telos-runtime/cortex/main.py
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

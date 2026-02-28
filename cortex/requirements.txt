@@ -11,3 +11,9 @@ protobuf>=4.25.0
 PyYAML>=6.0.1
 
 # Utilities (optional but recommended)
+
+# DNS Interception
+dnslib
+
+# Cognitive Verifier (Phase 4) — optional, falls back to heuristics
+# llama-cpp-python  # Uncomment after: pip install llama-cpp-python

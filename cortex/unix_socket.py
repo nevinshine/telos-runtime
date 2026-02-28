@@ -195,6 +195,50 @@ class CoreIPCClient:
             error = response.get('error', 'Unknown error') if response else 'No response'
             log.error(f"Core: Failed to clear taint for PID {pid}: {error}")
             return False
+
+    def update_inode(self, inode: int, sensitivity: int) -> bool:
+        """Update sensitivity for an inode."""
+        response = self._send_command('UPDATE_INODE', {
+            'inode': inode,
+            'sensitivity': sensitivity
+        })
+
+        if response and response.get('success'):
+            log.info(f"Core: Inode {inode} sensitivity updated to {sensitivity}")
+            return True
+        else:
+            error = response.get('error', 'Unknown error') if response else 'No response'
+            log.error(f"Core: Failed to update inode {inode} sensitivity: {error}")
+            return False
+
+    def update_network(self, ip: int, allowed: int) -> bool:
+        """Update network allowlist for an IP."""
+        resp = self._send_command('UPDATE_NETWORK', {
+            'ip': ip,
+            'allowed': allowed
+        })
+        return resp.get('success', False) if resp else False
+        
+    def add_network_rule(self, ip: int) -> bool:
+        """Allow traffic to a specific IP."""
+        return self.update_network(ip, 1)
+
+    def delete_network(self, ip: int) -> bool:
+        """
+        Remove an IP from the allowlist map entirely.
+        This frees up space in the BPF map.
+        """
+        resp = self._send_command('DELETE_NETWORK', {
+            'ip': ip
+        })
+        return resp.get('success', False) if resp else False
+
+    def remove_network_rule(self, ip: int) -> bool:
+        """
+        Block traffic to a specific IP by removing the rule.
+        """
+        # CHANGED: Use delete instead of update(0) to prevent map exhaustion
+        return self.delete_network(ip)
     
     def send_register_agent(self, pid: int, comm: str = "") -> bool:
         """
@@ -216,6 +260,8 @@ class CoreIPCClient:
             log.info(f"Core: Agent registered PID {pid}")
             return True
         else:
+            err = response.get('error', 'unknown mapping error') if response else 'No response from core'
+            log.error(f"Core: Failed to register agent {pid}: {err}")
             return False
     
     def get_state(self) -> Optional[Dict[str, Any]]:
@@ -231,7 +277,92 @@ class CoreIPCClient:
             return response.get('data', {})
         return None
     
-    def ping(self) -> bool:
-        """Check if Core is responsive."""
-        response = self._send_command('PING', {})
-        return response is not None and response.get('success', False)
+    def clear_network_rule(self, ip_int: int) -> bool:
+        """Helper to clear an IP from network map."""
+        res = self._send_command('DELETE_NETWORK', {'ip': ip_int})
+        return res is not None and res.get('success', False)
+
+    def ping_core(self) -> bool:
+        """
+        [Phase 11: Heartbeat Mechanism]
+        Send a heartbeat pulse to the Go Daemon.
+        If this stops, the Daemon executes emergency Fail-Open or Fail-Closed.
+        """
+        res = self._send_command('IPC_PING', {})
+        return res is not None and res.get('success', False)
+
+    # === Phase 5: Execution Policy ===
+
+    def send_update_exec(self, pid: int, allowed_bins: list, mode: int = 1) -> bool:
+        """
+        Push execution policy to BPF exec_policy_map.
+
+        Args:
+            pid: Agent process ID
+            allowed_bins: List of allowed binary names (max 8, 16 chars each)
+            mode: 0 = unrestricted, 1 = enforce allowlist
+
+        Returns:
+            True if Core acknowledged
+        """
+        response = self._send_command('UPDATE_EXEC', {
+            'pid': pid,
+            'mode': mode,
+            'allowed_bins': allowed_bins[:8],
+        })
+
+        if response and response.get('success'):
+            log.info(f"Core: Exec policy set for PID {pid}: {allowed_bins[:8]}")
+            return True
+
+        err = response.get('error', 'unknown error') if response else 'no response'
+        log.error(f"Core: Failed to set exec policy for PID {pid}: {err}")
+        return False
+
+    def send_clear_exec(self, pid: int) -> bool:
+        """
+        Remove execution policy for a PID.
+
+        Args:
+            pid: Agent process ID
+
+        Returns:
+            True if Core acknowledged
+        """
+        response = self._send_command('CLEAR_EXEC', {'pid': pid})
+
+        if response and response.get('success'):
+            log.info(f"Core: Exec policy cleared for PID {pid}")
+            return True
+        return False
+
+    # === Phase 4: Project Mirage ===
+
+    def add_mirage_trap(self, inode: int, honey_id: int, payload: str) -> bool:
+        """
+        Inject a honey-token trap into the kernel maps.
+        
+        Args:
+            inode: The real inode of the target file.
+            honey_id: A unique ID for this payload.
+            payload: The fake data to return (max 256 bytes per our C struct).
+        """
+        # Ensure payload fits within the kernel struct limits
+        encoded_payload = payload.encode('utf-8')[:256]
+        
+        response = self._send_command('ADD_MIRAGE', {
+            'inode': inode,
+            'honey_id': honey_id,
+            # Send as string; Go loader will convert to byte array
+            'payload': encoded_payload.decode('utf-8', errors='ignore') 
+        })
+        
+        if response and response.get('success'):
+            log.info(f"Core: Mirage trap armed for inode {inode} (HoneyID: {honey_id})")
+            return True
+        else:
+            error = response.get('error', 'Unknown error') if response else 'No response'
+            log.error(f"Core: Failed to arm Mirage trap for inode {inode}: {error}")
+            return False
+
+

@@ -1,0 +1,214 @@
+#!/bin/bash
+# Telos Runtime Orchestrator
+
+set -e
+
+# Configuration
+# Resolving symlink mapping for global execution
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DAEMON_LOG="/tmp/telos_daemon.log"
+CORTEX_LOG="/tmp/telos_cortex.log"
+DAEMON_PID_FILE="/tmp/telos_daemon.pid"
+CORTEX_PID_FILE="/tmp/telos_cortex.pid"
+BPF_PIN_PATH="/sys/fs/bpf/telos"
+
+# Colors
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+function print_header {
+  echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
+  echo -e "${CYAN}│${NC}                  ${BOLD}TELOS${NC}                   ${CYAN}│${NC}"
+  echo -e "${CYAN}│${NC}         ${DIM}Runtime Security Engine${NC}          ${CYAN}│${NC}"
+  echo -e "${CYAN}└──────────────────────────────────────────┘${NC}\n"
+}
+
+function check_root {
+  if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Error: Please run as root (use sudo).${NC}"
+    exit 1
+  fi
+}
+
+function start_telos {
+  echo "Starting Telos Runtime..."
+  
+  # Ensure we are executing make commands relative to the script's physical location
+  # This fixes builds when 'telos' is run globally via symlink /usr/local/bin/telos
+  cd "$DIR"
+
+  # 1. Build
+  echo -n "Building eBPF Core... "
+  make bpf > /dev/null 2>&1 || { echo -e "${RED}Failed to build BPF. Check make bpf output.${NC}"; exit 1; }
+  echo -e "${GREEN}OK${NC}"
+  
+  echo -n "Building Go Loader... "
+  make loader > /dev/null 2>&1 || { echo -e "${RED}Failed to build Loader. Check make loader output.${NC}"; exit 1; }
+  echo -e "${GREEN}OK${NC}"
+
+  # 2. Start Daemon
+  if [ -f "$DAEMON_PID_FILE" ] && kill -0 $(cat "$DAEMON_PID_FILE") 2>/dev/null; then
+    echo -e "${YELLOW}Warning: Telos Daemon is already running (PID: $(cat $DAEMON_PID_FILE)).${NC}"
+  else
+    echo -n "Starting Telos Daemon... "
+    nohup ./bin/telos_daemon < /dev/null > "$DAEMON_LOG" 2>&1 &
+    DAEMON_PID=$!
+    echo $DAEMON_PID > "$DAEMON_PID_FILE"
+    echo -e "${GREEN}OK (PID: $DAEMON_PID)${NC}"
+  fi
+
+  # Wait a second for socket to be ready
+  sleep 1
+
+  # 3. Start Cortex
+  if [ -f "$CORTEX_PID_FILE" ] && kill -0 $(cat "$CORTEX_PID_FILE") 2>/dev/null; then
+    echo -e "${YELLOW}Warning: Telos Cortex is already running (PID: $(cat $CORTEX_PID_FILE)).${NC}"
+  else
+    echo -n "Starting Telos Cortex... "
+    nohup python3 cortex/main.py < /dev/null > "$CORTEX_LOG" 2>&1 &
+    CORTEX_PID=$!
+    echo $CORTEX_PID > "$CORTEX_PID_FILE"
+    echo -e "${GREEN}OK (PID: $CORTEX_PID)${NC}"
+  fi
+
+  echo -e "\n${GREEN}Telos is now running.${NC}"
+  echo "- Daemon Log: $DAEMON_LOG"
+  echo "- Cortex Log: $CORTEX_LOG"
+}
+
+function stop_telos {
+  echo "Stopping Telos Runtime..."
+
+  # Stop Cortex
+  if [ -f "$CORTEX_PID_FILE" ]; then
+    PID=$(cat "$CORTEX_PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+      echo -n "Stopping Cortex (PID $PID)... "
+      kill -TERM "$PID"
+      sleep 2
+      if kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID"
+      fi
+      echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}Cortex is not running (stale PID file).${NC}"
+    fi
+    rm -f "$CORTEX_PID_FILE"
+  else
+      echo -e "${YELLOW}Cortex PID file not found.${NC}"
+  fi
+
+  # Stop Daemon
+  if [ -f "$DAEMON_PID_FILE" ]; then
+    PID=$(cat "$DAEMON_PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+      echo -n "Stopping Daemon (PID $PID)... "
+      kill -TERM "$PID"
+      sleep 2
+      if kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID"
+      fi
+      echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}Daemon is not running (stale PID file).${NC}"
+    fi
+    rm -f "$DAEMON_PID_FILE"
+  else
+      echo -e "${YELLOW}Daemon PID file not found.${NC}"
+  fi
+
+  # Cleanup BPF maps
+  echo -n "Cleaning up BPF maps... "
+  if mount | grep -q "$BPF_PIN_PATH"; then
+      umount "$BPF_PIN_PATH"
+  fi
+  rm -rf "$BPF_PIN_PATH"
+  echo -e "${GREEN}OK${NC}"
+  
+  echo -e "\n${GREEN}Telos stopped.${NC}"
+}
+
+function status_telos {
+  echo "Telos Runtime Status"
+  
+  # Check Daemon
+  if [ -f "$DAEMON_PID_FILE" ] && kill -0 $(cat "$DAEMON_PID_FILE") 2>/dev/null; then
+    echo -e "Telos Daemon:  ${GREEN}[RUNNING]${NC} (PID: $(cat $DAEMON_PID_FILE))"
+  else
+    echo -e "Telos Daemon:  ${RED}[STOPPED]${NC}"
+  fi
+
+  # Check Cortex
+  if [ -f "$CORTEX_PID_FILE" ] && kill -0 $(cat "$CORTEX_PID_FILE") 2>/dev/null; then
+    echo -e "Telos Cortex:  ${GREEN}[RUNNING]${NC} (PID: $(cat $CORTEX_PID_FILE))"
+  else
+    echo -e "Telos Cortex:  ${RED}[STOPPED]${NC}"
+  fi
+
+  # Check BPF Maps
+  echo -n "BPF Maps:      "
+  if [ -d "$BPF_PIN_PATH" ] && [ "$(ls -A $BPF_PIN_PATH 2>/dev/null)" ]; then
+    echo -e "${GREEN}[PINNED]${NC} ($BPF_PIN_PATH/)"
+  else
+    echo -e "${RED}[NOT FOUND]${NC}"
+  fi
+}
+
+# Ensure we're in the project root
+cd "$DIR"
+
+case "$1" in
+  start)
+    print_header
+    check_root
+    start_telos
+    ;;
+  stop)
+    print_header
+    check_root
+    stop_telos
+    ;;
+  status)
+    print_header
+    status_telos
+    ;;
+  dash)
+    python3 cortex/telemetry_ui.py || python3 telemetry_ui.py
+    ;;
+  help)
+    # ANSI Colors
+    CYAN='\033[0;36m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    RED='\033[0;31m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+
+    echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}                  ${BOLD}TELOS${NC}                   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}         ${DIM}Runtime Security Engine${NC}          ${CYAN}│${NC}"
+    echo -e "${CYAN}└──────────────────────────────────────────┘${NC}\n"
+    
+    echo -e "${BOLD}USAGE:${NC} sudo ./telos {${GREEN}start${NC}|${RED}stop${NC}|${CYAN}dash${NC}|${YELLOW}status${NC}|help}\n"
+    
+    echo -e "${BOLD}COMMANDS:${NC}"
+    echo -e "  ${GREEN}start${NC}    Builds and starts the Telos Daemon and Cortex AI."
+    echo -e "  ${RED}stop${NC}     Stops all background processes and cleans eBPF maps."
+    echo -e "  ${CYAN}dash${NC}     Launches the live Telemetry UI dashboard."
+    echo -e "  ${YELLOW}status${NC}   Displays the current status of the Daemon and Cortex."
+    echo -e "  ${DIM}help${NC}     Shows this message."
+    echo ""
+    ;;
+  *)
+    echo "Usage: sudo ./telos {start|stop|dash|status|help}"
+    exit 1
+    ;;
+esac
+
+exit 0

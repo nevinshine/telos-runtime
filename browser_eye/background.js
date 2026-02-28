@@ -93,6 +93,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             url: sender.tab?.url || sender.url || 'unknown',
             level: request.level,
             payload: request.payload || '',
+            session_id: request.session_id || '', // [NEW] Forward Session ID
             findings: request.findings || {},
             timestamp: Date.now()
         };

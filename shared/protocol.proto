@@ -4,19 +4,11 @@ package telos;
 
 option go_package = "github.com/nevinshine/telos-runtime/shared/pb";
 
-// The "Cortex" acts as the central server.
 service TelosControl {
-    // 1. Browser Eye reports finding hidden text/taint
     rpc ReportTaint (TaintReport) returns (Ack);
-
-    // 2. Agent declares what it wants to do (Intent)
     rpc DeclareIntent (IntentRequest) returns (IntentVerdict);
-
-    // 3. Daemons (Core/Edge) ask for latest rules
     rpc GetPolicy (PolicyQuery) returns (PolicyRules);
 }
-
-// --- MESSAGES ---
 
 message Ack {
     bool success = 1;
@@ -24,23 +16,27 @@ message Ack {
 }
 
 message TaintReport {
-    string source_id = 1;      // e.g., "tab_ID_123"
-    int32 pid = 2;             // Process ID of the browser
-    string url = 3;            // URL where taint was found
+    string source_id = 1;      
+    int32 pid = 2;
+    string url = 3;
     TaintLevel level = 4;
-    string payload_preview = 5; // First 64 chars of the hidden text
+    string payload_preview = 5;
+    string session_id = 6;
 }
 
 message IntentRequest {
     int32 agent_pid = 1;
-    string natural_language_goal = 2; // "I want to download invoices"
-    repeated string planned_actions = 3; // ["connect:billing.com:443"]
+    string natural_language_goal = 2;
+    repeated string planned_actions = 3;       // Network actions
+    string session_id = 4;               
+    repeated string planned_exec_actions = 5;  // [NEW] Execution actions
 }
 
 message IntentVerdict {
     bool allowed = 1;
     string reason = 2;
-    int64 policy_ttl_ms = 3;   // How long the firewall stays open
+    int64 policy_ttl_ms = 3;   
+    repeated string allowed_binaries = 4;      // [NEW] Binaries pushed to BPF
 }
 
 message PolicyQuery {
@@ -50,13 +46,13 @@ message PolicyQuery {
 message PolicyRules {
     TaintLevel max_allowed_taint = 1;
     repeated string allowed_ips = 2;
-    repeated string allowed_paths = 3; // e.g., "/tmp/downloads/*"
+    repeated string allowed_paths = 3;
 }
 
 enum TaintLevel {
     CLEAN = 0;
-    LOW = 1;       // Unverified Web
-    MEDIUM = 2;    // Hidden DOM Elements
-    HIGH = 3;      // Known Injection Signature
-    CRITICAL = 4;  // Shellcode / Payload Detected
+    LOW = 1;
+    MEDIUM = 2;    
+    HIGH = 3;
+    CRITICAL = 4;  
 }

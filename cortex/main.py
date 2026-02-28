@@ -21,7 +21,14 @@ from concurrent import futures
 from typing import Dict, Optional
 
 import grpc
+import grpc
 import yaml
+import glob  # [NEW] For resolving wildcards
+import stat  # [NEW] For file stats
+import threading
+import socket
+import struct
+
 
 # Add parent directory for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,12 +36,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared import protocol_pb2, protocol_pb2_grpc
 from cortex.guardian import Guardian
 from cortex.unix_socket import CoreIPCClient
+from cortex.verifier import IntentVerifier
+from cortex.dns_proxy import TelosDNSProxy # [NEW]
+from cortex.mirage_manager import MirageManager # [PHASE 4]
 
 # === CONFIGURATION ===
 
 DEFAULT_PORT = 50051
 DEFAULT_SOCKET = '/var/run/telos.sock'
 MAX_WORKERS = 10
+RATE_LIMIT_RPS = 5      # Max requests per second per agent PID
+RATE_LIMIT_BURST = 10   # Burst capacity per PID
 
 # === LOGGING ===
 
@@ -48,6 +60,56 @@ logging.basicConfig(
 )
 log = logging.getLogger('telos.cortex')
 
+
+# === RATE LIMITER (Token Bucket) ===
+
+class _TokenBucket:
+    """Per-PID token bucket rate limiter."""
+    __slots__ = ('tokens', 'last_refill', 'rate', 'burst')
+
+    def __init__(self, rate: float, burst: int):
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self.rate = rate
+        self.burst = burst
+
+    def consume(self) -> bool:
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+        self.last_refill = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
+class RateLimiter:
+    """Thread-safe per-PID rate limiter with stale entry cleanup."""
+
+    def __init__(self, rate: float = RATE_LIMIT_RPS, burst: int = RATE_LIMIT_BURST):
+        self._rate = rate
+        self._burst = burst
+        self._buckets: Dict[int, _TokenBucket] = {}
+        self._lock = threading.Lock()
+        self._last_cleanup = time.monotonic()
+
+    def allow(self, pid: int) -> bool:
+        """Return True if the request is allowed, False if rate-limited."""
+        with self._lock:
+            now = time.monotonic()
+            # Periodic cleanup of stale entries (every 60s)
+            if now - self._last_cleanup > 60:
+                stale = [p for p, b in self._buckets.items()
+                         if now - b.last_refill > 60]
+                for p in stale:
+                    del self._buckets[p]
+                self._last_cleanup = now
+
+            if pid not in self._buckets:
+                self._buckets[pid] = _TokenBucket(self._rate, self._burst)
+            return self._buckets[pid].consume()
+
 # === GRPC SERVICE IMPLEMENTATION ===
 
 class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
@@ -55,9 +117,12 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
     gRPC Service implementing the TelosControl protocol.
     """
     
-    def __init__(self, guardian: Guardian, ipc_client: CoreIPCClient):
+    def __init__(self, guardian: Guardian, ipc_client: CoreIPCClient, verifier: IntentVerifier, dns_proxy: TelosDNSProxy):
         self.guardian = guardian
         self.ipc = ipc_client
+        self.verifier = verifier
+        self.dns = dns_proxy # [NEW]
+        self.rate_limiter = RateLimiter()
         log.info("TelosControlService initialized")
     
     def ReportTaint(self, request: protocol_pb2.TaintReport, 
@@ -76,8 +141,12 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         
         try:
             # 1. Update Guardian state
-            self.guardian.update_taint(request.source_id, request.level, request.url)
-            
+            self.guardian.update_taint(
+                request.source_id,
+                request.level,
+                request.url,
+                request.session_id  # [NEW] Pass session ID for PID resolution
+            )
             # 2. Resolve Agent PID (PID Bridge logic)
             agent_pid = self.guardian.get_agent_pid_for_view(request.source_id)
             
@@ -117,27 +186,115 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         Currently: Allow all intents, log for audit.
         """
         log.info(f"[Intent] Agent {request.agent_pid}: {request.natural_language_goal}")
-        log.debug(f"    Planned actions: {request.planned_actions}")
-        
-        # Phase 2: Stub - allow all
-        # Phase 3: Will integrate with Guardian for actual verification
+
+        # Rate limit check — protect against DoS via intent flooding
+        if not self.rate_limiter.allow(request.agent_pid):
+            log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
+            # Push a lockdown policy to ensure malicious agents can't exploit rate limits
+            self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+            log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid} (Rate Limit Exceeded)")
+            return protocol_pb2.IntentVerdict(
+                allowed=False,
+                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second",
+                policy_ttl_ms=1000
+            )
+
+        # Verify Intent (Network + Execution gates)
+        exec_actions = list(request.planned_exec_actions) if hasattr(request, 'planned_exec_actions') else []
+        if exec_actions:
+            log.info(f"[Intent] Exec actions: {exec_actions}")
+
+        allowed, reason, ttl_ms, domains, allowed_bins = self.verifier.verify(
+            request.agent_pid, 
+            request.natural_language_goal, 
+            request.planned_actions,
+            exec_actions
+        )
+
+        if allowed:
+            log.info(f"✅ Intent APPROVED: {reason}")
+            
+            # [PHASE 5: Intent-Based Execution]
+            if allowed_bins:
+                self.ipc.send_update_exec(request.agent_pid, allowed_bins, mode=1)
+                log.info(f"🛡 Exec Drawbridge locked to: {allowed_bins}")
+                
+                # Schedule Cleanup Timer
+                def cleanup_exec(pid=request.agent_pid):
+                    self.ipc.send_clear_exec(pid)
+                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    
+                timer_exec = threading.Timer(ttl_ms / 1000.0, cleanup_exec)
+                timer_exec.start()
+
+            # [PHASE 3: Intent-Based Networking]
+            import socket
+            for domain in domains:
+                # 1. Authorize domain in DNS Proxy (Phase 4)
+                self.dns.allow_domain(domain, ttl_ms)
+                
+                # 2. Resolve domain to IP (Simple for Phase 3 MVP)
+                try:
+                    addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
+                    for _, _, _, _, sockaddr in addr_info:
+                        ip_str = sockaddr[0]
+                        import struct
+                        packed = socket.inet_aton(ip_str)
+                        ip_int = struct.unpack("!I", packed)[0]
+                        
+                        # 3. Push to Kernel Map
+                        if self.ipc.add_network_rule(ip_int):
+                            log.info(f"🌐 Drawbridge lowered for {domain} ({ip_str})")
+                            
+                            # 4. Schedule Cleanup Timer
+                            def cleanup(ip_to_remove=ip_int, domain_name=domain):
+                                self.ipc.remove_network_rule(ip_to_remove)
+                                log.info(f"🔒 Drawbridge raised for {domain_name}")
+                                
+                            timer = threading.Timer(ttl_ms / 1000.0, cleanup)
+                            timer.start()
+                except Exception as e:
+                    log.warning(f"Failed to resolve/allow domain {domain} for IPC: {e}")
+                
+        else:
+            log.warning(f"❌ Intent DENIED: {reason}")
+            # [PHASE 5: Intent-Based Execution]
+            if exec_actions:
+                self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
+                
+                # Release after TTL
+                def cleanup_deny(pid=request.agent_pid):
+                    self.ipc.send_clear_exec(pid)
+                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    
+                timer_deny = threading.Timer(10.0, cleanup_deny)  # 10s penalty box
+                timer_deny.start()
         
         # Register this agent if not already known
         self.guardian.register_agent(request.agent_pid)
         
+        # [NEW] Register Session ID if provided
+        if request.session_id:
+            self.guardian.register_session(request.session_id, request.agent_pid)
+        
         return protocol_pb2.IntentVerdict(
-            allowed=True,
-            reason="Intent noted (enforcement pending Phase 3)",
-            policy_ttl_ms=60000  # 1 minute
+            allowed=allowed,
+            reason=reason,
+            policy_ttl_ms=ttl_ms
         )
     
     def GetPolicy(self, request: protocol_pb2.PolicyQuery,
                   context: grpc.ServicerContext) -> protocol_pb2.PolicyRules:
         """
         Return current policy rules for a given PID.
-        Used by daemons to sync state.
+        Used by daemons to sync state. Also registers the agent for tracking.
         """
         log.debug(f"[Policy] Query from PID {request.pid}")
+        
+        # [NEW] Register agent for eBPF tracking
+        self.guardian.register_agent(request.pid)
+        self.ipc.send_register_agent(request.pid, "telos_agent")
         
         # Get current taint level for this process
         taint_level = self.guardian.get_taint_level(request.pid)
@@ -167,6 +324,18 @@ class CortexServer:
         self.guardian = None
         self.ipc = None
         self._shutdown = False
+        self._heartbeat_thread = None
+
+    def _heartbeat_loop(self):
+        """
+        [Phase 11] Background thread that continuously pulses the Go daemon.
+        If this thread dies, the Go daemon executes its Fail-Open/Fail-Closed protocol.
+        """
+        log.info("Starting Cortex Heartbeat Pulse...")
+        while not self._shutdown:
+            if self.ipc and self.ipc.connected:
+                self.ipc.ping_core()
+            time.sleep(2.0)
         
     def start(self):
         """Start the Cortex server."""
@@ -195,11 +364,15 @@ class CortexServer:
         log.info("Initializing...")
         
         # Load policy configuration
-        policy = self._load_policy()
+        self.policy = self._load_policy()
         
         # Initialize Guardian
-        self.guardian = Guardian(policy)
+        self.guardian = Guardian(self.policy)
         log.info("✓ Guardian initialized")
+        
+        # Initialize Verifier
+        self.verifier = IntentVerifier(self.guardian)
+        log.info("✓ Intent Verifier initialized")
         
         # Initialize IPC to Core
         self.ipc = CoreIPCClient(self.socket_path)
@@ -212,8 +385,16 @@ class CortexServer:
         # Create gRPC server
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=MAX_WORKERS))
         
+        # Initialize DNS Proxy
+        self.dns_proxy = TelosDNSProxy(self.ipc)
+        self.dns_proxy.start()
+
+        # [NEW] Initialize and Arm the Deception Engine
+        self.mirage = MirageManager(self.ipc, self.policy)
+        self.mirage.arm_traps()
+
         # Register service
-        service = TelosControlService(self.guardian, self.ipc)
+        service = TelosControlService(self.guardian, self.ipc, self.verifier, self.dns_proxy)
         protocol_pb2_grpc.add_TelosControlServicer_to_server(service, self.server)
         
         # Bind to port
@@ -224,14 +405,17 @@ class CortexServer:
         self.server.start()
         log.info(f"✓ gRPC server listening on port {self.port}")
         
+        # [NEW Phase 11] Start the Heartbeat Watchdog Pulse
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        
         print()
         print(f"{GREEN}  ╔═══════════════════════════════════════════════════════╗{RESET}")
         print(f"{GREEN}  ║{BOLD}               CORTEX ONLINE - Awaiting Input          {RESET}{GREEN}║{RESET}")
         print(f"{GREEN}  ╚═══════════════════════════════════════════════════════╝{RESET}")
         print()
         
-        # Wait for shutdown
-        self._wait_for_termination()
+        # [REMOVED] _wait_for_termination call from here
         
     def _load_policy(self) -> dict:
         """Load policy configuration from YAML."""
@@ -247,7 +431,7 @@ class CortexServer:
             log.error(f"Failed to load policy: {e}")
             return {}
     
-    def _wait_for_termination(self):
+    def wait_for_termination(self): # [NEW] Public method for waiting
         """Block until shutdown signal received."""
         try:
             while not self._shutdown:
@@ -260,6 +444,10 @@ class CortexServer:
     def stop(self):
         """Gracefully stop the server."""
         log.info("Shutting down Cortex...")
+        
+        if hasattr(self, 'dns_proxy'):
+            self.dns_proxy.stop()
+            log.info("✓ DNS Proxy stopped")
         
         if self.server:
             self.server.stop(grace=5)
@@ -275,6 +463,83 @@ class CortexServer:
         """Handle termination signals."""
         log.info(f"Received signal {signum}")
         self._shutdown = True
+
+# [NEW FUNCTION]
+def sync_filesystem_policy(config: dict, ipc: CoreIPCClient):
+    """
+    Resolve configured sensitive paths to inodes and push to Core.
+    """
+    fs_policy = config.get('filesystem', {})
+    sensitive_patterns = fs_policy.get('sensitive_paths', [])
+    
+    count = 0
+    for pattern in sensitive_patterns:
+        # Resolve wildcards
+        for filepath in glob.glob(pattern, recursive=True):
+            try:
+                # specific check for shadow/passwd to mark as critical?
+                # For now, everything in sensitive_paths is CRITICAL (2)
+                sensitivity = 2
+                
+                # Get inode
+                st = os.stat(filepath)
+                if stat.S_ISREG(st.st_mode): # Only regular files
+                    inode = st.st_ino
+                    
+                    # Push to Core
+                    if ipc.update_inode(inode, sensitivity):
+                        count += 1
+                        log.debug(f"Protected {filepath} (inode {inode})")
+            except Exception as e:
+                log.warning(f"Failed to protect {filepath}: {e}")
+                
+    log.info(f"✓ Protected {count} sensitive inodes")
+
+# [NEW FUNCTION]
+def sync_network_policy(config: dict, ipc: CoreIPCClient):
+    """
+    Push allowed network destinations (IPs) to Core.
+    """
+    net_policy = config.get('network', {})
+    allowed_hosts = net_policy.get('always_allowed', [])
+    
+    # Also resolve blocked hosts? No, our policy is "Deny All except Allowed"
+    # So we only need to push the allowlist.
+    
+    count = 0
+    import socket
+    
+    for host in allowed_hosts:
+        try:
+            # Resolve hostname to IPv4
+            # Note: This is a simple resolver. Production would need to handle
+            # multiple IPs per host, DNS rotation, and IPv6.
+            # Ideally, the agent would use a DNS proxy or update this dynamically.
+            # For M2 POC, we resolve once at startup.
+            addr_info = socket.getaddrinfo(host, None, socket.AF_INET)
+            
+            for _, _, _, _, sockaddr in addr_info:
+                ip_str = sockaddr[0] # e.g. "127.0.0.1"
+                
+                # Convert to uint32 (network byte order? typically host byte order for BPF maps usually)
+                # BPF usually expects network byte order if dealing with SKB, but we are using socket structs.
+                # Let's check bpf_lsm.c: dest_ip = addr->sin_addr.s_addr;
+                # sin_addr.s_addr is Network Byte Order (Big Endian).
+                # So we must push Network Byte Order.
+                
+                packed = socket.inet_aton(ip_str)
+                # unpack as Big Endian uint32
+                import struct
+                ip_int = struct.unpack("!I", packed)[0]
+                
+                if ipc.update_network(ip_int, 1): # 1 = Allowed
+                    count += 1
+                    log.debug(f"Allowed {host} -> {ip_str} ({ip_int})")
+
+        except Exception as e:
+            log.warning(f"Failed to resolve/allow {host}: {e}")
+            
+    log.info(f"✓ Allowed {count} network destinations")
 
 
 # === MAIN ===
@@ -304,6 +569,16 @@ def main():
     signal.signal(signal.SIGTERM, server.signal_handler)
     
     server.start()
+    
+    # [NEW] Sync filesystem policy (inodes)
+    log.info("Syncing filesystem policy to Core...")
+    sync_filesystem_policy(server.policy, server.ipc) 
+    
+    # [NEW] Sync network policy (allowlist)
+    log.info("Syncing network policy to Core...")
+    sync_network_policy(server.policy, server.ipc)
+
+    server.wait_for_termination()
 
 
 if __name__ == '__main__':

@@ -26,3 +26,18 @@ secrets/
 
 # Docker
 docker-compose.override.yml
+
+# Python Virtual Environments
+.venv/
+venv/
+
+# Model Weights (too large for git)
+models/*.gguf
+
+# Runtime Logs
+*.log
+logs/
+
+# Temp Files
+temp_*.py
+test_hyperion_bridge.py

@@ -139,7 +139,7 @@ class CortexClient:
             log.error(f"Failed to connect to Cortex: {e}")
             return False
     
-    def report_taint(self, source_id: str, url: str, level: str, payload: str) -> bool:
+    def report_taint(self, source_id: str, url: str, level: str, payload: str, session_id: str = "") -> bool:
         """Send taint report to Cortex"""
         if not self.stub:
             log.warning("Not connected to Cortex - dropping taint report")
@@ -153,7 +153,8 @@ class CortexClient:
                 source_id=source_id,
                 url=url,
                 level=level_value,
-                payload_preview=payload[:64] if payload else ''
+                payload_preview=payload[:64] if payload else '',
+                session_id=session_id
             )
             
             # Non-blocking: fire and forget for responsiveness
@@ -215,7 +216,8 @@ def main():
             
             # Forward to Cortex if connected
             if connected:
-                success = cortex.report_taint(source_id, url, level, payload)
+                session_id = msg.get('session_id', '')
+                success = cortex.report_taint(source_id, url, level, payload, session_id)
             else:
                 # Standalone mode - just log
                 success = True
