@@ -1,0 +1,122 @@
+# Telos Runtime — Security CI Workflow
+#
+# Runs on every push and pull request to main.
+# Jobs:
+#   go-security    — gosec (SAST) + govulncheck (CVE database) for all Go modules
+#   python-audit   — pip-audit for Python dependencies in cortex/
+#   secret-scan    — gitleaks for committed secrets / credential leaks
+#
+# Each job fails the check if security findings are detected.
+
+name: Security Checks
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  security-events: write  # required for uploading SARIF results
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Go security: SAST (gosec) + known-vulnerability scan (govulncheck)
+  # Runs against every Go module in the repository.
+  # ---------------------------------------------------------------------------
+  go-security:
+    name: Go Security (gosec + govulncheck)
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - telos_core/loader
+          - telos_core/mirage_poc
+          - telos_edge/loader
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      # govulncheck: check for known CVEs in module dependencies
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+      # gosec: static analysis for common Go security issues
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec
+        run: gosec -fmt sarif -out gosec-results.sarif ./... || true
+        # 'true' ensures we always upload the SARIF even when findings exist;
+        # the upload step below determines build failure via SARIF severity.
+
+      - name: Upload gosec SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ matrix.module }}/gosec-results.sarif
+          category: gosec-${{ matrix.module }}
+
+      # Fail the job if gosec found any issues (re-run without SARIF to get exit code)
+      - name: Fail on gosec findings
+        run: gosec ./...
+
+  # ---------------------------------------------------------------------------
+  # Python dependency audit: pip-audit scans cortex/requirements.txt for CVEs
+  # ---------------------------------------------------------------------------
+  python-audit:
+    name: Python Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: cortex/requirements.txt
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.9.0
+
+      # Audit pinned requirements file — fails if any known CVE is found
+      - name: Run pip-audit on cortex/requirements.txt
+        run: pip-audit -r cortex/requirements.txt --strict
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning: gitleaks detects hard-coded credentials / secrets
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret Scanning (gitleaks)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history required for gitleaks git mode
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

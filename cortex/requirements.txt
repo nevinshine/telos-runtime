@@ -1,19 +1,21 @@
 # Telos Cortex - Python Dependencies
+# Pinned for reproducible builds. To upgrade, test against the new version
+# and update this file, then re-run pip-audit to verify no known CVEs.
 
 # gRPC Runtime
-grpcio>=1.60.0
-grpcio-tools>=1.60.0
+grpcio==1.67.1
+grpcio-tools==1.67.1
 
 # Protocol Buffers
-protobuf>=4.25.0
+protobuf==5.29.4
 
 # Configuration
-PyYAML>=6.0.1
+PyYAML==6.0.2
 
 # Utilities (optional but recommended)
 
 # DNS Interception
-dnslib
+dnslib==0.9.25
 
 # Cognitive Verifier (Phase 4) — optional, falls back to heuristics
 # llama-cpp-python  # Uncomment after: pip install llama-cpp-python
