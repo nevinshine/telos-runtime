@@ -298,7 +298,7 @@ def make_handler(state: DashboardState, token: str, metrics_url: str = METRICS_U
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 last_payload = None
-                # TODO(follow-up): Add client limits or heartbeat timeouts if this is exposed beyond local demos.
+                loops_since_last = 0
                 while True:
                     payload = json.dumps(state.snapshot())
                     if payload != last_payload:
@@ -306,8 +306,18 @@ def make_handler(state: DashboardState, token: str, metrics_url: str = METRICS_U
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                             self.wfile.flush()
                             last_payload = payload
+                            loops_since_last = 0
                         except (BrokenPipeError, ConnectionResetError):
                             break
+                    else:
+                        loops_since_last += 1
+                        if loops_since_last >= 15:
+                            try:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                                loops_since_last = 0
+                            except (BrokenPipeError, ConnectionResetError):
+                                break
                     time.sleep(1)
                 return
 
