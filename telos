@@ -102,7 +102,9 @@ function start_telos {
   else
     step_work "Starting Telos Cortex"
     rm -f "$CORTEX_LOG"
-    nohup python3 cortex/main.py $ARGS < /dev/null > "$CORTEX_LOG" 2>&1 &
+    USER_PACKAGES="/home/${SUDO_USER:-$USER}/.local/lib/python3.14/site-packages"
+    CORTEX_TOKEN="${TELOS_CORTEX_AUTH_TOKEN:-telos-dev-token}"
+    nohup env PYTHONPATH="$USER_PACKAGES:$PYTHONPATH" TELOS_CORTEX_LOG="$CORTEX_LOG" TELOS_CORTEX_AUTH_TOKEN="$CORTEX_TOKEN" python3 cortex/main.py $ARGS < /dev/null > "$CORTEX_LOG" 2>&1 &
     CORTEX_PID=$!
     echo $CORTEX_PID > "$CORTEX_PID_FILE"
     step_done "${GRAY}(PID: $CORTEX_PID)${NC}"

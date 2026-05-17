@@ -51,6 +51,9 @@ MAX_WORKERS = 10
 RATE_LIMIT_RPS = 5      # Max requests per second per agent PID
 RATE_LIMIT_BURST = 10   # Burst capacity per PID
 
+# Suppress noisy grpc/absl internal logs
+os.environ.setdefault('GRPC_VERBOSITY', 'NONE')
+
 # === LOGGING ===
 
 LOG_PATH = os.getenv(
@@ -496,12 +499,23 @@ class CortexServer:
         for offset in range(5):
             try_port = self.port + offset
             address = f'{self.bind_host}:{try_port}'
-            port_result = self.server.add_insecure_port(address)
-            if port_result > 0:
-                if offset > 0:
-                    self.port = try_port
-                bound = True
-                break
+            try:
+                port_result = self.server.add_insecure_port(address)
+                if port_result > 0:
+                    if offset > 0:
+                        self.port = try_port
+                    bound = True
+                    break
+            except RuntimeError:
+                # grpcio >= 1.64 raises RuntimeError on bind failure
+                if offset < 4:
+                    # Need a fresh server object since the old one is tainted
+                    self.server = grpc.server(
+                        futures.ThreadPoolExecutor(max_workers=MAX_WORKERS),
+                        interceptors=(CortexAuthInterceptor(self.auth_token),),
+                    )
+                    protocol_pb2_grpc.add_TelosControlServicer_to_server(service, self.server)
+                continue
 
         if not bound:
             step(f"Could not bind to ports {self.port}–{self.port + 4}", "fail")

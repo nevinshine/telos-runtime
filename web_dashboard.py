@@ -26,7 +26,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 
 EVENTS_SOCKET = "/var/run/telos_events.sock"
-CORTEX_LOG = "/tmp/telos_cortex.log"
+CORTEX_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "telos_cortex.log")
 METRICS_URL = "http://127.0.0.1:9094/metrics"
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_dashboard")
 MAX_EVENTS = 100
