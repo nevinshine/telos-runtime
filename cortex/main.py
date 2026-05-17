@@ -475,13 +475,28 @@ class CortexServer:
         service = TelosControlService(self.guardian, self.ipc, self.verifier, self.dns_proxy)
         protocol_pb2_grpc.add_TelosControlServicer_to_server(service, self.server)
         
-        # Bind to port
-        address = f'{self.bind_host}:{self.port}'
-        self.server.add_insecure_port(address)
+        # Bind to port (auto-fallback if taken)
+        bound = False
+        for offset in range(5):
+            try_port = self.port + offset
+            address = f'{self.bind_host}:{try_port}'
+            port_result = self.server.add_insecure_port(address)
+            if port_result > 0:
+                if offset > 0:
+                    log.warning(f"⚠ Port {self.port} was taken, fell back to {try_port}")
+                    self.port = try_port
+                bound = True
+                break
+            else:
+                log.warning(f"⚠ Port {try_port} is in use, trying next...")
+
+        if not bound:
+            log.error(f"❌ Could not bind to any port in range {self.port}–{self.port + 4}")
+            sys.exit(1)
         
         # Start
         self.server.start()
-        log.info(f"✓ gRPC server listening on {address}")
+        log.info(f"✓ gRPC server listening on {self.bind_host}:{self.port}")
         
         # [NEW Phase 11] Start the Heartbeat Watchdog Pulse
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
