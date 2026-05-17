@@ -34,12 +34,13 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared import protocol_pb2, protocol_pb2_grpc
-from cortex.auth import CortexAuthInterceptor, get_auth_token
+from cortex.auth import CortexAuthInterceptor
 from cortex.guardian import Guardian
 from cortex.unix_socket import CoreIPCClient
 from cortex.verifier import IntentVerifier
-from cortex.dns_proxy import TelosDNSProxy # [NEW]
-from cortex.mirage_manager import MirageManager # [PHASE 4]
+from cortex.dns_proxy import TelosDNSProxy
+from cortex.mirage_manager import MirageManager
+from cortex.config import load_config, CortexSettings, PolicyConfig
 
 # === CONFIGURATION ===
 
@@ -378,17 +379,16 @@ class CortexServer:
     
     def __init__(
         self,
-        port: int,
-        socket_path: str,
-        policy_path: str,
-        bind_host: str = DEFAULT_BIND_HOST,
-        auth_token: str | None = None,
+        settings: CortexSettings,
+        policy: PolicyConfig,
     ):
-        self.port = port
-        self.bind_host = bind_host
-        self.auth_token = get_auth_token(auth_token)
-        self.socket_path = socket_path
-        self.policy_path = policy_path
+        self.settings = settings
+        self.policy = policy.model_dump() # Convert to dict for legacy compatibility
+        self.port = settings.port
+        self.bind_host = settings.bind_host
+        self.auth_token = settings.auth_token
+        self.socket_path = settings.socket_path
+        
         self.server = None
         self.guardian = None
         self.ipc = None
@@ -432,8 +432,7 @@ class CortexServer:
         
         log.info("Initializing...")
         
-        # Load policy configuration
-        self.policy = self._load_policy()
+        # Policy is already loaded and validated via load_config
         
         # Initialize Guardian
         self.guardian = Guardian(self.policy)
@@ -490,18 +489,8 @@ class CortexServer:
         # [REMOVED] _wait_for_termination call from here
         
     def _load_policy(self) -> dict:
-        """Load policy configuration from YAML."""
-        try:
-            with open(self.policy_path, 'r') as f:
-                policy = yaml.safe_load(f) or {}
-                log.info(f"✓ Loaded policy from {self.policy_path}")
-                return policy
-        except FileNotFoundError:
-            log.warning(f"⚠ Policy file not found: {self.policy_path}, using defaults")
-            return {}
-        except Exception as e:
-            log.error(f"Failed to load policy: {e}")
-            return {}
+        """Deprecated: Use load_config instead."""
+        return self.policy
     
     def wait_for_termination(self): # [NEW] Public method for waiting
         """Block until shutdown signal received."""
@@ -639,14 +628,11 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Load and Validate Configuration (Env Vars + Policy)
+    settings, policy = load_config(args)
+    
     # Create and run server
-    server = CortexServer(
-        args.port,
-        args.socket,
-        args.policy,
-        bind_host=args.bind_host,
-        auth_token=args.auth_token,
-    )
+    server = CortexServer(settings, policy)
     
     # Register signal handlers
     signal.signal(signal.SIGINT, server.signal_handler)
