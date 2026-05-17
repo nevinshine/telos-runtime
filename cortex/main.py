@@ -256,6 +256,15 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             # Push a lockdown policy to ensure malicious agents can't exploit rate limits
             self.ipc.send_update_exec(request.agent_pid, [], mode=1)
             log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid} (Rate Limit Exceeded)")
+
+            # Schedule cleanup to lift the penalty after 1 second
+            def cleanup_exec(pid=request.agent_pid):
+                self.ipc.send_clear_exec(pid)
+                log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+
+            timer_exec = threading.Timer(1.0, cleanup_exec)
+            timer_exec.start()
+
             return protocol_pb2.IntentVerdict(
                 allowed=False,
                 reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second",
