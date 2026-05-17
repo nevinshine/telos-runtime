@@ -40,7 +40,7 @@ from cortex.unix_socket import CoreIPCClient
 from cortex.verifier import IntentVerifier
 from cortex.dns_proxy import TelosDNSProxy
 from cortex.mirage_manager import MirageManager
-from cortex.config import load_config, CortexSettings, PolicyConfig
+from cortex.config import load_config  # [NEW] Pydantic config validation
 
 # === CONFIGURATION ===
 
@@ -379,16 +379,19 @@ class CortexServer:
     
     def __init__(
         self,
-        settings: CortexSettings,
-        policy: PolicyConfig,
+        port: int,
+        socket_path: str,
+        policy_path: str,
+        bind_host: str = DEFAULT_BIND_HOST,
+        auth_token: str | None = None,
+        validated_policy: dict | None = None,
     ):
-        self.settings = settings
-        self.policy = policy.model_dump() # Convert to dict for legacy compatibility
-        self.port = settings.port
-        self.bind_host = settings.bind_host
-        self.auth_token = settings.auth_token
-        self.socket_path = settings.socket_path
-        
+        self.port = port
+        self.bind_host = bind_host
+        self.auth_token = auth_token
+        self.socket_path = socket_path
+        self.policy_path = policy_path
+        self._validated_policy = validated_policy
         self.server = None
         self.guardian = None
         self.ipc = None
@@ -432,7 +435,11 @@ class CortexServer:
         
         log.info("Initializing...")
         
-        # Policy is already loaded and validated via load_config
+        # Load policy configuration (validated by Pydantic if available)
+        if self._validated_policy:
+            self.policy = self._validated_policy
+        else:
+            self.policy = self._load_policy()
         
         # Initialize Guardian
         self.guardian = Guardian(self.policy)
@@ -489,8 +496,18 @@ class CortexServer:
         # [REMOVED] _wait_for_termination call from here
         
     def _load_policy(self) -> dict:
-        """Deprecated: Use load_config instead."""
-        return self.policy
+        """Fallback policy loader (used when Pydantic validation is bypassed)."""
+        try:
+            with open(self.policy_path, 'r') as f:
+                policy = yaml.safe_load(f) or {}
+                log.info(f"✓ Loaded policy from {self.policy_path}")
+                return policy
+        except FileNotFoundError:
+            log.warning(f"⚠ Policy file not found: {self.policy_path}, using defaults")
+            return {}
+        except Exception as e:
+            log.error(f"Failed to load policy: {e}")
+            return {}
     
     def wait_for_termination(self): # [NEW] Public method for waiting
         """Block until shutdown signal received."""
@@ -628,11 +645,19 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Load and Validate Configuration (Env Vars + Policy)
-    settings, policy = load_config(args)
-    
+    # [NEW] Validate all configuration before starting (fail-fast)
+    settings, validated_policy = load_config(args)
+    log.info("✓ Configuration validated (Pydantic)")
+
     # Create and run server
-    server = CortexServer(settings, policy)
+    server = CortexServer(
+        settings.port,
+        settings.socket_path,
+        args.policy,
+        bind_host=settings.bind_host,
+        auth_token=settings.auth_token,
+        validated_policy=validated_policy.model_dump(),
+    )
     
     # Register signal handlers
     signal.signal(signal.SIGINT, server.signal_handler)
