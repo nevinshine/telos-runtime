@@ -411,71 +411,87 @@ class CortexServer:
         
     def start(self):
         """Start the Cortex server."""
-        # ANSI color codes
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
-        GREEN = "\033[32m"
-        CYAN = "\033[36m"
-        MAGENTA = "\033[35m"
-        PURPLE = "\033[38;5;135m"
-        
-        # Print colorful banner
+        # ANSI
+        R  = "\033[0m"
+        B  = "\033[1m"
+        D  = "\033[2m"
+        G  = "\033[32m"
+        Y  = "\033[33m"
+        C  = "\033[36m"
+        M  = "\033[35m"
+        P  = "\033[38;5;135m"
+        W  = "\033[37m"
+        BG = "\033[48;5;235m"
+        UP = "\033[1A"
+        CLR = "\033[2K"
+
+        def step(msg, status="working"):
+            if status == "working":
+                print(f"  {D}◼{R}  {msg}{D}...{R}")
+            elif status == "ok":
+                print(f"  {G}▶{R}  {msg}")
+            elif status == "warn":
+                print(f"  {Y}▲{R}  {msg}")
+            elif status == "fail":
+                print(f"  {P}✕{R}  {msg}")
+
+        # Suppress log noise during boot
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+        root_logger.setLevel(logging.CRITICAL)
+
         print()
-        print(f"{PURPLE}   ██████╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗{RESET}")
-        print(f"{PURPLE}  ██╔════╝██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝{RESET}")
-        print(f"{PURPLE}  ██║     ██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝ {RESET}")
-        print(f"{PURPLE}  ██║     ██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗ {RESET}")
-        print(f"{PURPLE}  ╚██████╗╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗{RESET}")
-        print(f"{PURPLE}   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{RESET}")
+        print(f"  {P}{B}cortex{R} {D}v0.5.0{R}")
         print()
-        print(f"{CYAN}            ╔═══════════════════════════════╗{RESET}")
-        print(f"{CYAN}            ║{BOLD}       AI SECURITY BRAIN       {RESET}{CYAN}║{RESET}")
-        print(f"{CYAN}            ╚═══════════════════════════════╝{RESET}")
-        print()
-        
-        log.info("Initializing...")
-        
-        # Load policy configuration (validated by Pydantic if available)
+
+        # 1. Policy
         if self._validated_policy:
             self.policy = self._validated_policy
         else:
             self.policy = self._load_policy()
-        
-        # Initialize Guardian
+        step(f"Policy loaded {D}({len(self.policy)} sections){R}", "ok")
+
+        # 2. Guardian
         self.guardian = Guardian(self.policy)
-        log.info("✓ Guardian initialized")
-        
-        # Initialize Verifier
+        step("Guardian initialized", "ok")
+
+        # 3. Verifier
         self.verifier = IntentVerifier(self.guardian)
-        log.info("✓ Intent Verifier initialized")
-        
-        # Initialize IPC to Core
+        di_status = "DI" if self.verifier.di else ""
+        ei_status = "EI" if self.verifier.ei else ""
+        llm_status = "LLM" if self.verifier.llm else ""
+        engines = " + ".join(filter(None, [di_status, ei_status, llm_status])) or "Heuristic"
+        step(f"Intent Verifier {D}({engines}){R}", "ok")
+
+        # 4. IPC
         self.ipc = CoreIPCClient(self.socket_path)
         connected = self.ipc.connect()
         if connected:
-            log.info(f"✓ Connected to Core at {self.socket_path}")
+            step(f"Core IPC {D}({self.socket_path}){R}", "ok")
         else:
-            log.warning(f"⚠ Core not available at {self.socket_path} - running standalone")
-        
-        # Create gRPC server
+            step(f"Core IPC {D}(standalone mode){R}", "warn")
+
+        # 5. gRPC server
         self.server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=MAX_WORKERS),
             interceptors=(CortexAuthInterceptor(self.auth_token),),
         )
-        
-        # Initialize DNS Proxy
+
+        # 6. DNS Proxy
         self.dns_proxy = TelosDNSProxy(self.ipc)
         self.dns_proxy.start()
+        step(f"DNS Proxy {D}(127.0.0.1:5353){R}", "ok")
 
-        # [NEW] Initialize and Arm the Deception Engine
+        # 7. Mirage
         self.mirage = MirageManager(self.ipc, self.policy)
         self.mirage.arm_traps()
+        honey_count = len(self.policy.get('mirage', {}).get('honey_files', []))
+        step(f"Project Mirage {D}({honey_count} traps){R}", "ok")
 
-        # Register service
+        # 8. Bind service + port
         service = TelosControlService(self.guardian, self.ipc, self.verifier, self.dns_proxy)
         protocol_pb2_grpc.add_TelosControlServicer_to_server(service, self.server)
-        
-        # Bind to port (auto-fallback if taken)
+
         bound = False
         for offset in range(5):
             try_port = self.port + offset
@@ -483,29 +499,33 @@ class CortexServer:
             port_result = self.server.add_insecure_port(address)
             if port_result > 0:
                 if offset > 0:
-                    log.warning(f"⚠ Port {self.port} was taken, fell back to {try_port}")
                     self.port = try_port
                 bound = True
                 break
-            else:
-                log.warning(f"⚠ Port {try_port} is in use, trying next...")
 
         if not bound:
-            log.error(f"❌ Could not bind to any port in range {self.port}–{self.port + 4}")
+            step(f"Could not bind to ports {self.port}–{self.port + 4}", "fail")
             sys.exit(1)
-        
-        # Start
+
         self.server.start()
-        log.info(f"✓ gRPC server listening on {self.bind_host}:{self.port}")
-        
-        # [NEW Phase 11] Start the Heartbeat Watchdog Pulse
+        step(f"gRPC server {D}({self.bind_host}:{self.port}){R}", "ok")
+
+        # 9. Heartbeat
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
-        
+        step("Heartbeat watchdog", "ok")
+
+        # Restore logging
+        root_logger.setLevel(original_level)
+
+        # Final summary
         print()
-        print(f"{GREEN}  ╔═══════════════════════════════════════════════════════╗{RESET}")
-        print(f"{GREEN}  ║{BOLD}               CORTEX ONLINE - Awaiting Input          {RESET}{GREEN}║{RESET}")
-        print(f"{GREEN}  ╚═══════════════════════════════════════════════════════╝{RESET}")
+        print(f"  {G}{B}ready{R} in {D}~1s{R}")
+        print()
+        print(f"  {D}┃{R}  {B}gRPC{R}    {C}grpc://{self.bind_host}:{self.port}{R}")
+        print(f"  {D}┃{R}  {B}DNS{R}     {C}udp://127.0.0.1:5353{R}")
+        print(f"  {D}┃{R}  {B}IPC{R}     {C}{self.socket_path}{R}")
+        print(f"  {D}┃{R}  {B}Mode{R}    {P}{engines}{R}")
         print()
         
         # [REMOVED] _wait_for_termination call from here
@@ -662,7 +682,6 @@ def main():
     
     # [NEW] Validate all configuration before starting (fail-fast)
     settings, validated_policy = load_config(args)
-    log.info("✓ Configuration validated (Pydantic)")
 
     # Create and run server
     server = CortexServer(
@@ -680,13 +699,17 @@ def main():
     
     server.start()
     
-    # [NEW] Sync filesystem policy (inodes)
-    log.info("Syncing filesystem policy to Core...")
+    # Suppress sync noise
+    root_logger = logging.getLogger()
+    sync_level = root_logger.level
+    root_logger.setLevel(logging.CRITICAL)
+
+    # Sync policies silently
     sync_filesystem_policy(server.policy, server.ipc) 
-    
-    # [NEW] Sync network policy (allowlist)
-    log.info("Syncing network policy to Core...")
     sync_network_policy(server.policy, server.ipc)
+
+    # Restore logging for runtime
+    root_logger.setLevel(sync_level)
 
     server.wait_for_termination()
 
