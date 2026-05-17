@@ -89,7 +89,7 @@ struct {
 
 // [Phase 5] Execution Allowlist map: PID -> exec_policy_t
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct exec_policy_t);
