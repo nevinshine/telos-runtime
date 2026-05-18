@@ -174,7 +174,7 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         if not session_id:
             return
 
-        mapped_pid = self.guardian.session_map.get(session_id)
+        mapped_pid = self.guardian.get_session_pid(session_id)
         if mapped_pid is not None and mapped_pid != pid:
             _context_abort(
                 context,

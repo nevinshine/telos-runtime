@@ -9,6 +9,7 @@ Manages:
 """
 
 import logging
+import threading
 import time
 from typing import Dict, Optional, Set
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ class Guardian:
     
     def __init__(self, policy: dict):
         self.policy = policy
+        self._lock = threading.RLock()
         
         # Agent registry: PID -> AgentInfo
         self.agents: Dict[int, AgentInfo] = {}
@@ -67,12 +69,19 @@ class Guardian:
     
     # === AGENT REGISTRY ===
 
+    def get_session_pid(self, session_id: str) -> Optional[int]:
+        """Return the PID bound to a session ID, or None."""
+        if not session_id:
+            return None
+        with self._lock:
+            return self.session_map.get(session_id)
+
     def register_session(self, session_id: str, pid: int) -> bool:
         """Register a session ID for an agent."""
         if not session_id:
             return False
-            
-        self.session_map[session_id] = pid
+        with self._lock:
+            self.session_map[session_id] = pid
         log.info(f"Session mapped: {session_id[:8]}... -> PID {pid}")
         return True
     
@@ -83,39 +92,41 @@ class Guardian:
         In Phase 2, the most recently registered agent is considered "active"
         and will receive taint from browser views.
         """
-        if pid in self.agents:
-            log.debug(f"Agent {pid} already registered")
-            return True
-        
-        self.agents[pid] = AgentInfo(pid=pid)
-        self.active_agent_pid = pid  # Most recent becomes active
+        with self._lock:
+            if pid in self.agents:
+                log.debug(f"Agent {pid} already registered")
+                return True
+            
+            self.agents[pid] = AgentInfo(pid=pid)
+            self.active_agent_pid = pid  # Most recent becomes active
         
         log.info(f"[+] Agent registered: PID {pid}")
         return True
     
     def unregister_agent(self, pid: int) -> bool:
         """Unregister an agent when it exits."""
-        if pid not in self.agents:
-            return False
-        
-        del self.agents[pid]
-        
-        # Clean session map
-        for sid, p in list(self.session_map.items()):
-            if p == pid:
-                del self.session_map[sid]
-        
-        # Update active agent
-        if self.active_agent_pid == pid:
-            if self.agents:
-                self.active_agent_pid = list(self.agents.keys())[-1]
-            else:
-                self.active_agent_pid = None
-        
-        # Clean up view mappings
-        for source_id, mapped_pid in list(self.view_agent_map.items()):
-            if mapped_pid == pid:
-                del self.view_agent_map[source_id]
+        with self._lock:
+            if pid not in self.agents:
+                return False
+            
+            del self.agents[pid]
+            
+            # Clean session map
+            for sid, p in list(self.session_map.items()):
+                if p == pid:
+                    del self.session_map[sid]
+            
+            # Update active agent
+            if self.active_agent_pid == pid:
+                if self.agents:
+                    self.active_agent_pid = list(self.agents.keys())[-1]
+                else:
+                    self.active_agent_pid = None
+            
+            # Clean up view mappings
+            for source_id, mapped_pid in list(self.view_agent_map.items()):
+                if mapped_pid == pid:
+                    del self.view_agent_map[source_id]
         
         log.info(f"[-] Agent unregistered: PID {pid}")
         return True
@@ -132,32 +143,35 @@ class Guardian:
             url: URL where taint was detected
             session_id: Optional session ID from browser
         """
-        self.taint_records[source_id] = TaintRecord(
-            source_id=source_id,
-            level=level,
-            url=url
-        )
-        
-        # Also update the associated agent's taint level
-        agent_pid = self.get_agent_pid_for_view(source_id, session_id)
-        if agent_pid and agent_pid in self.agents:
-            # Agent's taint is the max of all their views
-            current_max = self.agents[agent_pid].taint_level
-            if level > current_max:
-                self.agents[agent_pid].taint_level = level
-                log.warning(f"Agent {agent_pid} taint escalated to {level}")
+        with self._lock:
+            self.taint_records[source_id] = TaintRecord(
+                source_id=source_id,
+                level=level,
+                url=url
+            )
+            
+            # Also update the associated agent's taint level
+            agent_pid = self._get_agent_pid_for_view_unlocked(source_id, session_id)
+            if agent_pid and agent_pid in self.agents:
+                # Agent's taint is the max of all their views
+                current_max = self.agents[agent_pid].taint_level
+                if level > current_max:
+                    self.agents[agent_pid].taint_level = level
+                    log.warning(f"Agent {agent_pid} taint escalated to {level}")
     
     def get_taint_level(self, pid: int) -> int:
         """Get current taint level for an agent PID."""
-        if pid in self.agents:
-            return self.agents[pid].taint_level
-        return 0  # CLEAN for unknown processes
+        with self._lock:
+            if pid in self.agents:
+                return self.agents[pid].taint_level
+            return 0  # CLEAN for unknown processes
     
     def clear_taint(self, pid: int) -> None:
         """Reset taint level for an agent (after cooldown/verification)."""
-        if pid in self.agents:
-            self.agents[pid].taint_level = 0
-            log.info(f"Taint cleared for agent {pid}")
+        with self._lock:
+            if pid in self.agents:
+                self.agents[pid].taint_level = 0
+                log.info(f"Taint cleared for agent {pid}")
     
     # === PID BRIDGE ===
     
@@ -170,6 +184,11 @@ class Guardian:
         2. Check explicit source_id mapping
         3. Fall back to active agent (Phase 2 legacy)
         """
+        with self._lock:
+            return self._get_agent_pid_for_view_unlocked(source_id, session_id)
+
+    def _get_agent_pid_for_view_unlocked(self, source_id: str, session_id: str = "") -> Optional[int]:
+        """Internal unlocked version — caller must hold self._lock."""
         # 1. Session ID (Strongest Link)
         if session_id and session_id in self.session_map:
             pid = self.session_map[session_id]
@@ -193,14 +212,15 @@ class Guardian:
     
     def map_view_to_agent(self, source_id: str, pid: int) -> bool:
         """Explicitly map a browser view to an agent."""
-        if pid not in self.agents:
-            log.warning(f"Cannot map view to unknown agent {pid}")
-            return False
-        
-        self.view_agent_map[source_id] = pid
-        self.agents[pid].active_views.add(source_id)
-        log.debug(f"View {source_id} mapped to agent {pid}")
-        return True
+        with self._lock:
+            if pid not in self.agents:
+                log.warning(f"Cannot map view to unknown agent {pid}")
+                return False
+            
+            self.view_agent_map[source_id] = pid
+            self.agents[pid].active_views.add(source_id)
+            log.debug(f"View {source_id} mapped to agent {pid}")
+            return True
     
     # === POLICY ===
     
@@ -215,7 +235,8 @@ class Guardian:
         Returns True if taint level exceeds policy threshold.
         """
         max_taint = self.policy.get('max_taint_for_exec', 2)  # Default: MEDIUM
-        current_taint = self.get_taint_level(pid)
+        with self._lock:
+            current_taint = self.agents[pid].taint_level if pid in self.agents else 0
         
         if current_taint > max_taint:
             log.warning(f"BLOCK: Agent {pid} exceeds taint threshold ({current_taint} > {max_taint})")
@@ -226,22 +247,23 @@ class Guardian:
     
     def get_state_summary(self) -> dict:
         """Get a summary of current guardian state for debugging."""
-        return {
-            'agents': {
-                pid: {
-                    'taint_level': info.taint_level,
-                    'active_views': list(info.active_views),
-                    'registered_at': info.registered_at
+        with self._lock:
+            return {
+                'agents': {
+                    pid: {
+                        'taint_level': info.taint_level,
+                        'active_views': list(info.active_views),
+                        'registered_at': info.registered_at
+                    }
+                    for pid, info in self.agents.items()
+                },
+                'active_agent': self.active_agent_pid,
+                'taint_records': {
+                    sid: {
+                        'level': rec.level,
+                        'url': rec.url,
+                        'age_seconds': time.time() - rec.timestamp
+                    }
+                    for sid, rec in self.taint_records.items()
                 }
-                for pid, info in self.agents.items()
-            },
-            'active_agent': self.active_agent_pid,
-            'taint_records': {
-                sid: {
-                    'level': rec.level,
-                    'url': rec.url,
-                    'age_seconds': time.time() - rec.timestamp
-                }
-                for sid, rec in self.taint_records.items()
             }
-        }
