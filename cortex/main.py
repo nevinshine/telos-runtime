@@ -208,7 +208,7 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 request.session_id  # [NEW] Pass session ID for PID resolution
             )
             # 2. Resolve Agent PID (PID Bridge logic)
-            agent_pid = self.guardian.get_agent_pid_for_view(request.source_id)
+            agent_pid = self.guardian.get_agent_pid_for_view(request.source_id, request.session_id)
             
             if agent_pid is None:
                 log.warning(f"No agent registered for source {request.source_id}")
