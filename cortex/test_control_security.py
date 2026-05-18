@@ -121,7 +121,7 @@ class CortexControlSecurityTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, grpc.StatusCode.INVALID_ARGUMENT)
         self.assertEqual(ipc.registered, [])
-        self.assertNotIn(999999, service.guardian.agents)
+        self.assertFalse(service.guardian.has_agent(999999))
 
 
 if __name__ == "__main__":
