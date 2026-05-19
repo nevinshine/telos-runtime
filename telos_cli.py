@@ -217,8 +217,10 @@ def cmd_start(extra_args: list[str]):
         results.append(("Telos Daemon", "skip", f"already running (PID: {daemon_pid})"))
     else:
         DAEMON_LOG.unlink(missing_ok=True)
+        cortex_token = os.environ.get("TELOS_CORTEX_AUTH_TOKEN", "telos-dev-token")
+        daemon_args = ["./bin/telos_daemon", f"--auth-token={cortex_token}"] + extra_args
         proc = subprocess.Popen(
-            ["./bin/telos_daemon"] + extra_args,
+            daemon_args,
             cwd=str(PROJECT_DIR),
             stdin=subprocess.DEVNULL,
             stdout=open(DAEMON_LOG, "w"),

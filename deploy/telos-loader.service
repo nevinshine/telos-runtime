@@ -7,6 +7,9 @@ Type=simple
 # Must run as root to load eBPF programs into the kernel
 User=root
 WorkingDirectory=/home/nevinshine/code/telos-runtime
+# IMPORTANT: Set TELOS_CORTEX_AUTH_TOKEN to the same value used by Cortex.
+# The daemon reads TELOS_CORE_AUTH_TOKEN automatically; or pass it via --auth-token.
+# Example: Environment="TELOS_CORE_AUTH_TOKEN=replace-with-a-long-random-token"
 ExecStart=/home/nevinshine/code/telos-runtime/bin/telos_daemon --socket /var/run/telos.sock
 
 Restart=on-failure

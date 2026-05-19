@@ -30,8 +30,9 @@ class CoreIPCClient:
     to update BPF maps.
     """
     
-    def __init__(self, socket_path: str = DEFAULT_SOCKET_PATH):
+    def __init__(self, socket_path: str = DEFAULT_SOCKET_PATH, auth_token: str = ""):
         self.socket_path = socket_path
+        self.auth_token = auth_token
         self.sock: Optional[socket.socket] = None
         self.connected = False
     
@@ -94,8 +95,12 @@ class CoreIPCClient:
             # Build message
             message = {
                 'command': command,
-                'data': data
+                'data': data,
             }
+            
+            # Include auth token if configured (defense in depth)
+            if self.auth_token:
+                message['token'] = self.auth_token
             
             # Send as JSON + newline
             payload = json.dumps(message) + '\n'

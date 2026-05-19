@@ -499,7 +499,7 @@ class CortexServer:
         step(f"Intent Verifier {D}({engines}){R}", "ok")
 
         # 4. IPC
-        self.ipc = CoreIPCClient(self.socket_path)
+        self.ipc = CoreIPCClient(self.socket_path, auth_token=self.auth_token or "")
         connected = self.ipc.connect()
         if connected:
             step(f"Core IPC {D}({self.socket_path}){R}", "ok")

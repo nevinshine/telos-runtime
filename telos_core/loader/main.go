@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -37,6 +38,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sys/unix"
 )
 
 // === CONFIGURATION ===
@@ -102,6 +104,7 @@ type Config struct {
 type IPCCommand struct {
 	Command string                 `json:"command"`
 	Data    map[string]interface{} `json:"data"`
+	Token   string                 `json:"token,omitempty"`
 }
 
 // IPCResponse is the JSON response to Cortex
@@ -170,6 +173,10 @@ type TelosDaemon struct {
 	eventClients   map[net.Conn]struct{}
 	clientsMu      sync.Mutex
 	done           chan struct{}
+
+	// [Issue #29: IPC Authentication]
+	authToken  string // Shared secret required on every IPC command
+	allowedUID uint32 // Only connections from this UID are accepted (0 = root)
 }
 
 // === PHASE 12: PROMETHEUS METRICS ===
@@ -207,7 +214,7 @@ func init() {
 	prometheus.MustRegister(metricActiveDrawbridges)
 }
 
-func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
+func NewTelosDaemon(socketPath, bpfObjPath, authToken string) *TelosDaemon {
 	failPolicy := os.Getenv("TELOS_FAIL_POLICY")
 	if failPolicy == "" {
 		failPolicy = "CLOSED" // Default to maximum security zero-trust
@@ -222,6 +229,8 @@ func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
 		failPolicy:       failPolicy,
 		watchdogActive:   false, // Initially inactive
 		lastPingTime:     time.Now(),
+		authToken:        authToken,
+		allowedUID:       0, // Only root by default
 	}
 }
 
@@ -482,8 +491,8 @@ func (d *TelosDaemon) startSocketServer() error {
 	}
 	d.listener = listener
 
-	// Set socket permissions
-	os.Chmod(d.socketPath, 0666)
+	// Restrict socket to daemon owner (root) only
+	os.Chmod(d.socketPath, 0660)
 
 	// [Phase 11: Heartbeat Watchdog]
 	go d.watchdogRoutine()
@@ -647,9 +656,61 @@ func (d *TelosDaemon) acceptConnections() {
 	}
 }
 
+// verifyPeer checks that the connecting process is running as the expected user.
+// Uses SO_PEERCRED which the kernel fills in — cannot be spoofed by userspace.
+func (d *TelosDaemon) verifyPeer(conn net.Conn) error {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return fmt.Errorf("not a unix socket connection")
+	}
+
+	raw, err := unixConn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("syscall conn failed: %w", err)
+	}
+
+	var cred *unix.Ucred
+	var sockErr error
+	err = raw.Control(func(fd uintptr) {
+		cred, sockErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	})
+	if err != nil {
+		return fmt.Errorf("control failed: %w", err)
+	}
+	if sockErr != nil {
+		return fmt.Errorf("getsockopt failed: %w", sockErr)
+	}
+
+	if cred.Uid != d.allowedUID {
+		return fmt.Errorf("connection from UID %d rejected (expected %d)", cred.Uid, d.allowedUID)
+	}
+
+	log.Printf("[AUTH] Peer verified: PID=%d UID=%d GID=%d", cred.Pid, cred.Uid, cred.Gid)
+	return nil
+}
+
+// checkToken validates the IPC command token against the daemon's auth token.
+// Uses constant-time comparison to prevent timing attacks.
+func (d *TelosDaemon) checkToken(token string) bool {
+	if d.authToken == "" {
+		return true // No auth configured — allow all
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(d.authToken)) == 1
+}
+
 // handleConnection processes a single socket connection
 func (d *TelosDaemon) handleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Verify peer credentials before processing any commands
+	if err := d.verifyPeer(conn); err != nil {
+		log.Printf("[AUTH] Connection rejected: %v", err)
+		d.sendResponse(conn, IPCResponse{
+			Success: false,
+			Error:   "Connection rejected: " + err.Error(),
+		})
+		return
+	}
 
 	reader := bufio.NewReader(conn)
 
@@ -666,6 +727,16 @@ func (d *TelosDaemon) handleConnection(conn net.Conn) {
 			d.sendResponse(conn, IPCResponse{
 				Success: false,
 				Error:   "Invalid JSON: " + err.Error(),
+			})
+			continue
+		}
+
+		// Verify auth token on every command
+		if !d.checkToken(cmd.Token) {
+			log.Printf("[AUTH] Command %q rejected: invalid token", cmd.Command)
+			d.sendResponse(conn, IPCResponse{
+				Success: false,
+				Error:   "Invalid auth token",
 			})
 			continue
 		}
@@ -1055,6 +1126,7 @@ func (d *TelosDaemon) Stop() {
 func main() {
 	socketPath := flag.String("socket", defaultSocketPath, "Unix socket path")
 	bpfObj := flag.String("bpf-obj", defaultBPFObj, "Path to compiled BPF object")
+	authToken := flag.String("auth-token", "", "IPC auth token (or set TELOS_CORE_AUTH_TOKEN)")
 	flag.Parse()
 
 	// Check for root
@@ -1062,7 +1134,16 @@ func main() {
 		log.Fatal("Telos Core requires root privileges to load eBPF")
 	}
 
-	daemon := NewTelosDaemon(*socketPath, *bpfObj)
+	// Auth token: flag takes precedence, fall back to env var
+	token := *authToken
+	if token == "" {
+		token = os.Getenv("TELOS_CORE_AUTH_TOKEN")
+	}
+	if token != "" {
+		log.Println("✓ IPC auth token configured")
+	}
+
+	daemon := NewTelosDaemon(*socketPath, *bpfObj, token)
 
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
