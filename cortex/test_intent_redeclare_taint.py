@@ -53,12 +53,13 @@ class FakeDNSProxy:
 
 class IntentRedeclareTaintTests(unittest.TestCase):
     def test_declare_intent_rejects_kernel_tainted_pid(self):
-        ipc = FakeIPC({222: protocol_pb2.TaintLevel.CRITICAL})
+        pid = os.getpid()
+        ipc = FakeIPC({pid: protocol_pb2.TaintLevel.CRITICAL})
         verifier = FakeVerifier(allowed=True)
         service = TelosControlService(Guardian({}), ipc, verifier, FakeDNSProxy())
 
         request = protocol_pb2.IntentRequest(
-            agent_pid=222,
+            agent_pid=pid,
             natural_language_goal="download weather",
             planned_actions=["curl https://weather.com"],
         )
@@ -73,9 +74,10 @@ class IntentRedeclareTaintTests(unittest.TestCase):
         ipc = FakeIPC({})
         verifier = FakeVerifier(allowed=True)
         service = TelosControlService(Guardian({}), ipc, verifier, FakeDNSProxy())
+        pid = os.getpid()
 
         request = protocol_pb2.IntentRequest(
-            agent_pid=333,
+            agent_pid=pid,
             natural_language_goal="download weather",
             planned_actions=["curl https://weather.com"],
         )

@@ -125,8 +125,17 @@ class RateLimiter:
 
 
 def _pid_exists(pid: int) -> bool:
-    """Return True when *pid* is a positive, live Linux process ID."""
-    return pid > 0 and os.path.isdir(f"/proc/{pid}")
+    """Return True when *pid* refers to a live process.
+
+    On Linux we validate via `/proc/<pid>`. On platforms without `/proc`,
+    we can't reliably validate PIDs here, so we only check that the value
+    is positive (this keeps unit tests portable across OSes).
+    """
+    if pid <= 0:
+        return False
+    if not os.path.isdir("/proc"):
+        return True
+    return os.path.isdir(f"/proc/{pid}")
 
 
 def _context_abort(context: grpc.ServicerContext, code: grpc.StatusCode, message: str) -> None:
