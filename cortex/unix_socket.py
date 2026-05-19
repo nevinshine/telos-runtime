@@ -276,6 +276,22 @@ class CoreIPCClient:
         if response and response.get('success'):
             return response.get('data', {})
         return None
+
+    def get_pid_taint_level(self, pid: int) -> Optional[int]:
+        """Return the current kernel taint level for *pid* when Core is reachable."""
+        state = self.get_state()
+        if not state:
+            return None
+        processes = state.get("processes") or {}
+        if not isinstance(processes, dict):
+            return None
+        rec = processes.get(str(pid))
+        if not isinstance(rec, dict):
+            return None
+        try:
+            return int(rec.get("taint_level", 0))
+        except Exception:
+            return None
     
     def clear_network_rule(self, ip_int: int) -> bool:
         """Helper to clear an IP from network map."""

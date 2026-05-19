@@ -17,6 +17,7 @@ import signal
 import sys
 import os
 import time
+import tempfile
 from concurrent import futures
 from typing import Dict, Optional
 
@@ -250,6 +251,28 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self._validate_pid(request.agent_pid, context, "DeclareIntent")
         self._validate_session_binding(request.session_id, request.agent_pid, context)
 
+        # Sync kernel taint state from Core before issuing a fresh policy.
+        # This prevents "intent replay" where a previously-tainted PID tries to
+        # redeclare a new intent and regain privileges.
+        try:
+            core_taint = self.ipc.get_pid_taint_level(request.agent_pid)
+            if core_taint is not None:
+                self.guardian.update_core_taint(request.agent_pid, core_taint)
+                if core_taint >= protocol_pb2.TaintLevel.HIGH:
+                    log.warning(
+                        "[Intent] Denied: PID %d is tainted in kernel (%d)",
+                        request.agent_pid,
+                        core_taint,
+                    )
+                    self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                    return protocol_pb2.IntentVerdict(
+                        allowed=False,
+                        reason=f"Agent is tainted in kernel ({core_taint}), intent rejected.",
+                        policy_ttl_ms=1000,
+                    )
+        except Exception as e:
+            # Standalone mode or Core unavailable — fall back to Guardian-only state.
+            log.debug("Core taint sync skipped: %s", e)
         # Rate limit check — protect against DoS via intent flooding
         if not self.rate_limiter.allow(request.agent_pid):
             log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
