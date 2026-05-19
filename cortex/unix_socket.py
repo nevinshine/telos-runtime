@@ -9,6 +9,8 @@ Protocol:
     - Responses: {success: bool, error?: string, data?: object}
 """
 
+import hashlib
+import hmac
 import json
 import socket
 import logging
@@ -75,13 +77,34 @@ class CoreIPCClient:
             self.connected = False
             log.debug("IPC connection closed")
     
-    def _send_command(self, command: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _sign_command(self, command: str, data: Dict[str, Any]) -> str:
+        """
+        Compute HMAC-SHA256 signature for the command payload.
+        Covers command name + canonical JSON data to prevent tampering.
+        """
+        if not self.auth_token:
+            return ""
+        data_str = json.dumps(data, sort_keys=True, separators=(',', ':'))
+        payload = f"{command}:{data_str}"
+        return hmac.new(
+            self.auth_token.encode('utf-8'),
+            payload.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _send_command(
+        self,
+        command: str,
+        data: Dict[str, Any],
+        role: str = "admin",
+    ) -> Optional[Dict[str, Any]]:
         """
         Send a command to Core and wait for response.
         
         Args:
             command: Command type (UPDATE_TAINT, CLEAR_TAINT, etc.)
             data: Command payload
+            role: Caller role ("admin" or "monitor")
             
         Returns:
             Response dict or None on failure
@@ -96,11 +119,13 @@ class CoreIPCClient:
             message = {
                 'command': command,
                 'data': data,
+                'role': role,
             }
             
             # Include auth token if configured (defense in depth)
             if self.auth_token:
                 message['token'] = self.auth_token
+                message['signature'] = self._sign_command(command, data)
             
             # Send as JSON + newline
             payload = json.dumps(message) + '\n'

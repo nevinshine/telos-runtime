@@ -17,8 +17,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -102,9 +105,33 @@ type Config struct {
 
 // IPCCommand is the JSON command from Cortex
 type IPCCommand struct {
-	Command string                 `json:"command"`
-	Data    map[string]interface{} `json:"data"`
-	Token   string                 `json:"token,omitempty"`
+	Command   string                 `json:"command"`
+	Data      map[string]interface{} `json:"data"`
+	Token     string                 `json:"token,omitempty"`
+	Signature string                 `json:"signature,omitempty"`
+	Role      string                 `json:"role,omitempty"`
+}
+
+// Permission roles for IPC commands
+const (
+	RoleMonitor = "monitor"
+	RoleAdmin   = "admin"
+)
+
+// commandRoles defines which role is required for each command.
+var commandRoles = map[string]string{
+	"PING":          RoleMonitor,
+	"IPC_PING":      RoleMonitor,
+	"GET_STATE":     RoleMonitor,
+	"UPDATE_TAINT":  RoleAdmin,
+	"CLEAR_TAINT":   RoleAdmin,
+	"REGISTER_AGENT": RoleAdmin,
+	"UPDATE_INODE":  RoleAdmin,
+	"UPDATE_NETWORK": RoleAdmin,
+	"DELETE_NETWORK": RoleAdmin,
+	"UPDATE_EXEC":   RoleAdmin,
+	"CLEAR_EXEC":    RoleAdmin,
+	"ADD_MIRAGE":    RoleAdmin,
 }
 
 // IPCResponse is the JSON response to Cortex
@@ -689,6 +716,30 @@ func (d *TelosDaemon) verifyPeer(conn net.Conn) error {
 	return nil
 }
 
+// verifyHMAC checks the HMAC-SHA256 signature of the command payload.
+// The signature covers the command name and canonical JSON data, preventing
+// tampering even if an attacker has socket access.
+func (d *TelosDaemon) verifyHMAC(cmd IPCCommand) bool {
+	if d.authToken == "" {
+		return true // No auth configured
+	}
+	if cmd.Signature == "" {
+		return false // Signature required when auth is active
+	}
+
+	dataBytes, err := json.Marshal(cmd.Data)
+	if err != nil {
+		return false
+	}
+	payload := cmd.Command + ":" + string(dataBytes)
+
+	mac := hmac.New(sha256.New, []byte(d.authToken))
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	return subtle.ConstantTimeCompare([]byte(cmd.Signature), []byte(expected)) == 1
+}
+
 // checkToken validates the IPC command token against the daemon's auth token.
 // Uses constant-time comparison to prevent timing attacks.
 func (d *TelosDaemon) checkToken(token string) bool {
@@ -696,6 +747,27 @@ func (d *TelosDaemon) checkToken(token string) bool {
 		return true // No auth configured — allow all
 	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(d.authToken)) == 1
+}
+
+// checkRole verifies the caller's role is sufficient for the command.
+// "monitor" can only call read-only commands (PING, GET_STATE).
+// "admin" can call everything.
+func (d *TelosDaemon) checkRole(cmd IPCCommand) bool {
+	required, exists := commandRoles[cmd.Command]
+	if !exists {
+		return false // Unknown command
+	}
+
+	callerRole := cmd.Role
+	if callerRole == "" {
+		callerRole = RoleAdmin // Default to admin for backward compatibility
+	}
+
+	if required == RoleMonitor {
+		return callerRole == RoleMonitor || callerRole == RoleAdmin
+	}
+	// Admin required
+	return callerRole == RoleAdmin
 }
 
 // handleConnection processes a single socket connection
@@ -737,6 +809,26 @@ func (d *TelosDaemon) handleConnection(conn net.Conn) {
 			d.sendResponse(conn, IPCResponse{
 				Success: false,
 				Error:   "Invalid auth token",
+			})
+			continue
+		}
+
+		// Verify HMAC signature to prevent tampering
+		if !d.verifyHMAC(cmd) {
+			log.Printf("[AUTH] Command %q rejected: invalid HMAC signature", cmd.Command)
+			d.sendResponse(conn, IPCResponse{
+				Success: false,
+				Error:   "Invalid HMAC signature",
+			})
+			continue
+		}
+
+		// Verify caller role is sufficient for this command
+		if !d.checkRole(cmd) {
+			log.Printf("[AUTH] Command %q rejected: role %q insufficient", cmd.Command, cmd.Role)
+			d.sendResponse(conn, IPCResponse{
+				Success: false,
+				Error:   "Insufficient permissions for command",
 			})
 			continue
 		}
