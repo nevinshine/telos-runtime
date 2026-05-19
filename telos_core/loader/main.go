@@ -779,9 +779,15 @@ func (d *TelosDaemon) cmdRegisterAgent(data map[string]interface{}) IPCResponse 
 
 	comm, _ := data["comm"].(string)
 
-	info := ProcessInfo{
-		PID:        pid,
-		TaintLevel: TaintClean,
+	// Preserve any existing taint state for this PID. The kernel may have
+	// elevated taint (e.g., IFC -> CRITICAL) and re-registration must not
+	// "reset" that state.
+	info := ProcessInfo{PID: pid, TaintLevel: TaintClean}
+	var existing ProcessInfo
+	if err := d.maps.ProcessMap.Lookup(pid, &existing); err == nil {
+		info.TaintLevel = existing.TaintLevel
+		info.IsSandboxed = existing.IsSandboxed
+		info.Comm = existing.Comm
 	}
 
 	// Copy comm name
@@ -793,7 +799,7 @@ func (d *TelosDaemon) cmdRegisterAgent(data map[string]interface{}) IPCResponse 
 		return IPCResponse{Success: false, Error: err.Error()}
 	}
 
-	log.Printf("[REGISTER] Agent PID %d (%s)", pid, comm)
+	log.Printf("[REGISTER] Agent PID %d (%s) taint=%d", pid, comm, info.TaintLevel)
 	return IPCResponse{Success: true}
 }
 

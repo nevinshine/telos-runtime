@@ -62,6 +62,10 @@ class Guardian:
         
         # Session ID mapping: session_id -> PID
         self.session_map: Dict[str, int] = {}
+
+        # Kernel-taint snapshot: PID -> taint_level
+        # Used to avoid losing taint state across control-plane re-declarations.
+        self.core_taint: Dict[int, int] = {}
         
         log.info("Guardian initialized")
     
@@ -149,9 +153,20 @@ class Guardian:
     
     def get_taint_level(self, pid: int) -> int:
         """Get current taint level for an agent PID."""
+        core_level = self.core_taint.get(pid, 0)
         if pid in self.agents:
-            return self.agents[pid].taint_level
+            return max(self.agents[pid].taint_level, core_level)
+        if core_level:
+            return core_level
         return 0  # CLEAN for unknown processes
+
+    def update_core_taint(self, pid: int, taint_level: int) -> None:
+        """Record the latest kernel taint snapshot for a PID."""
+        if pid <= 0:
+            return
+        current = self.core_taint.get(pid, 0)
+        if taint_level > current:
+            self.core_taint[pid] = taint_level
     
     def clear_taint(self, pid: int) -> None:
         """Reset taint level for an agent (after cooldown/verification)."""
