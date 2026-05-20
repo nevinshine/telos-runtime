@@ -161,14 +161,17 @@ class DomainIntel:
                 domain   TEXT PRIMARY KEY,
                 category TEXT NOT NULL,
                 trust    INTEGER NOT NULL DEFAULT 50,
-                source   TEXT NOT NULL DEFAULT 'seed'
+                source   TEXT NOT NULL DEFAULT 'seed',
+                last_seen INTEGER DEFAULT 0,
+                threat_score INTEGER DEFAULT 0,
+                flags TEXT DEFAULT ''
             )
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_domain ON domains(domain)")
 
         # Bulk insert seed data
         self.conn.executemany(
-            "INSERT OR IGNORE INTO domains (domain, category, trust) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO domains (domain, category, trust, last_seen, threat_score, flags) VALUES (?, ?, ?, strftime('%s','now'), 0, '')",
             SEED_DOMAINS
         )
         self.conn.commit()
@@ -371,7 +374,7 @@ class DomainIntel:
         This is the self-learning mechanism.
         """
         self.conn.execute(
-            "INSERT OR REPLACE INTO domains (domain, category, trust, source) VALUES (?, ?, ?, 'llm')",
+            "INSERT OR REPLACE INTO domains (domain, category, trust, source, last_seen, threat_score, flags) VALUES (?, ?, ?, 'llm', strftime('%s','now'), 0, '')",
             (domain, category, trust)
         )
         self.conn.commit()

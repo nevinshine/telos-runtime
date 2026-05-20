@@ -17,6 +17,7 @@ import signal
 import sys
 import os
 import time
+import tempfile
 from concurrent import futures
 from typing import Dict, Optional
 
@@ -124,8 +125,17 @@ class RateLimiter:
 
 
 def _pid_exists(pid: int) -> bool:
-    """Return True when *pid* is a positive, live Linux process ID."""
-    return pid > 0 and os.path.isdir(f"/proc/{pid}")
+    """Return True when *pid* refers to a live process.
+
+    On Linux we validate via `/proc/<pid>`. On platforms without `/proc`,
+    we can't reliably validate PIDs here, so we only check that the value
+    is positive (this keeps unit tests portable across OSes).
+    """
+    if pid <= 0:
+        return False
+    if not os.path.isdir("/proc"):
+        return True
+    return os.path.isdir(f"/proc/{pid}")
 
 
 def _context_abort(context: grpc.ServicerContext, code: grpc.StatusCode, message: str) -> None:
@@ -250,6 +260,28 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self._validate_pid(request.agent_pid, context, "DeclareIntent")
         self._validate_session_binding(request.session_id, request.agent_pid, context)
 
+        # Sync kernel taint state from Core before issuing a fresh policy.
+        # This prevents "intent replay" where a previously-tainted PID tries to
+        # redeclare a new intent and regain privileges.
+        try:
+            core_taint = self.ipc.get_pid_taint_level(request.agent_pid)
+            if core_taint is not None:
+                self.guardian.update_core_taint(request.agent_pid, core_taint)
+                if core_taint >= protocol_pb2.TaintLevel.HIGH:
+                    log.warning(
+                        "[Intent] Denied: PID %d is tainted in kernel (%d)",
+                        request.agent_pid,
+                        core_taint,
+                    )
+                    self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                    return protocol_pb2.IntentVerdict(
+                        allowed=False,
+                        reason=f"Agent is tainted in kernel ({core_taint}), intent rejected.",
+                        policy_ttl_ms=1000,
+                    )
+        except Exception as e:
+            # Standalone mode or Core unavailable — fall back to Guardian-only state.
+            log.debug("Core taint sync skipped: %s", e)
         # Rate limit check — protect against DoS via intent flooding
         if not self.rate_limiter.allow(request.agent_pid):
             log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
@@ -407,9 +439,22 @@ class CortexServer:
         If this thread dies, the Go daemon executes its Fail-Open/Fail-Closed protocol.
         """
         log.info("Starting Cortex Heartbeat Pulse...")
+        sweep_counter = 0
         while not self._shutdown:
             if self.ipc and self.ipc.connected:
                 self.ipc.ping_core()
+            
+            # Periodically sweep dead agents to prevent memory leaks and PID collision attacks
+            sweep_counter += 1
+            if sweep_counter >= 10:
+                sweep_counter = 0
+                dead_pids = [pid for pid in list(self.guardian.agents.keys()) if not _pid_exists(pid)]
+                for pid in dead_pids:
+                    self.guardian.unregister_agent(pid)
+                    if self.ipc and self.ipc.connected:
+                        self.ipc.send_clear_exec(pid)
+                        self.ipc.send_clear_taint(pid) # Also flushes from eBPF ProcessMap
+
             time.sleep(2.0)
         
     def start(self):

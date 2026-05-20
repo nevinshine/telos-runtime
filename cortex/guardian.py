@@ -67,8 +67,12 @@ class Guardian:
         self._view_agent_map: Dict[str, int] = {}
 
         # Session ID mapping: session_id -> PID
-        self._session_map: Dict[str, int] = {}
+        self.session_map: Dict[str, int] = {}
 
+        # Kernel-taint snapshot: PID -> taint_level
+        # Used to avoid losing taint state across control-plane re-declarations.
+        self.core_taint: Dict[int, int] = {}
+        
         log.info("Guardian initialized")
 
     # === AGENT REGISTRY ===
@@ -107,65 +111,34 @@ class Guardian:
 
         log.info(f"[+] Agent registered: PID {pid}")
         return True
+    
+    def unregister_agent(self, pid: int) -> bool:
+        """Unregister an agent when it exits."""
+        if pid not in self.agents:
+            return False
+        
+        del self.agents[pid]
+        
+        # Clean session map
+        for sid, p in list(self.session_map.items()):
+            if p == pid:
+                del self.session_map[sid]
+        
+        # Update active agent
+        if self.active_agent_pid == pid:
+            if self.agents:
+                self.active_agent_pid = list(self.agents.keys())[-1]
+            else:
+                self.active_agent_pid = None
+        
+        # Clean up view mappings
+        for source_id, mapped_pid in list(self.view_agent_map.items()):
+            if mapped_pid == pid:
+                del self.view_agent_map[source_id]
 
-    def unregister_agent(self, pid: int, *, cleanup_taint_records: bool = True) -> bool:
-        """Unregister an agent when it exits.
-
-        Performs full cleanup of agent state:
-        1. Collects all views mapped to this PID (from active_views + view_agent_map)
-        2. Optionally removes taint_records for those views
-        3. Removes the agent entry (drops active_views from memory)
-        4. Removes session mappings for this PID
-        5. Updates active_agent_pid if this was the active agent
-        6. Removes view->agent mappings for this PID
-
-        Args:
-            pid: Agent PID to unregister.
-            cleanup_taint_records: If True (default), also remove taint_records
-                for views that were assigned to this agent.
-        """
-        with self._lock:
-            if pid not in self._agents:
-                return False
-
-            # 1. Collect all views mapped to this PID from both:
-            #    - active_views (agent's view set)
-            #    - view_agent_map (bidirectional mapping)
-            exiting_views: Set[str] = set(self._agents[pid].active_views)
-            for source_id, mapped_pid in list(self._view_agent_map.items()):
-                if mapped_pid == pid:
-                    exiting_views.add(source_id)
-
-            # 2. Optionally clean up taint_records for views mapped to this PID
-            if cleanup_taint_records:
-                for source_id in exiting_views:
-                    self._taint_records.pop(source_id, None)
-
-            # 3. Remove the agent entry (also drops the active_views set)
-            del self._agents[pid]
-
-            # 3a. Remove from registration order tracking
-            try:
-                self._registration_order.remove(pid)
-            except ValueError:
-                pass  # Should not happen, but be defensive
-
-            # 4. Clean session map
-            for sid, p in list(self._session_map.items()):
-                if p == pid:
-                    del self._session_map[sid]
-
-            # 5. Update active agent using explicit registration order
-            if self._active_agent_pid == pid:
-                if self._agents:
-                    self._active_agent_pid = self._registration_order[-1]
-                else:
-                    self._active_agent_pid = None
-
-            # 6. Clean up view->agent mappings for this PID
-            for source_id in exiting_views:
-                self._view_agent_map.pop(source_id, None)
-
+        if pid in self.core_taint:
+            del self.core_taint[pid]
+            
         log.info(f"[-] Agent unregistered: PID {pid}")
         return True
 
@@ -199,18 +172,29 @@ class Guardian:
 
     def get_taint_level(self, pid: int) -> int:
         """Get current taint level for an agent PID."""
-        with self._lock:
-            if pid in self._agents:
-                return self._agents[pid].taint_level
-            return 0  # CLEAN for unknown processes
+        core_level = self.core_taint.get(pid, 0)
+        if pid in self.agents:
+            return max(self.agents[pid].taint_level, core_level)
+        if core_level:
+            return core_level
+        return 0  # CLEAN for unknown processes
 
+    def update_core_taint(self, pid: int, taint_level: int) -> None:
+        """Record the latest kernel taint snapshot for a PID."""
+        if pid <= 0:
+            return
+        current = self.core_taint.get(pid, 0)
+        if taint_level > current:
+            self.core_taint[pid] = taint_level
+    
     def clear_taint(self, pid: int) -> None:
         """Reset taint level for an agent (after cooldown/verification)."""
-        with self._lock:
-            if pid in self._agents:
-                self._agents[pid].taint_level = 0
-                log.info(f"Taint cleared for agent {pid}")
-
+        if pid in self.agents:
+            self.agents[pid].taint_level = 0
+            if pid in self.core_taint:
+                self.core_taint[pid] = 0
+            log.info(f"Taint cleared for agent {pid}")
+    
     # === PID BRIDGE ===
 
     def get_agent_pid_for_view(self, source_id: str, session_id: str = "") -> Optional[int]:
