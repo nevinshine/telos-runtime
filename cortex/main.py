@@ -439,9 +439,22 @@ class CortexServer:
         If this thread dies, the Go daemon executes its Fail-Open/Fail-Closed protocol.
         """
         log.info("Starting Cortex Heartbeat Pulse...")
+        sweep_counter = 0
         while not self._shutdown:
             if self.ipc and self.ipc.connected:
                 self.ipc.ping_core()
+            
+            # Periodically sweep dead agents to prevent memory leaks and PID collision attacks
+            sweep_counter += 1
+            if sweep_counter >= 10:
+                sweep_counter = 0
+                dead_pids = [pid for pid in list(self.guardian.agents.keys()) if not _pid_exists(pid)]
+                for pid in dead_pids:
+                    self.guardian.unregister_agent(pid)
+                    if self.ipc and self.ipc.connected:
+                        self.ipc.send_clear_exec(pid)
+                        self.ipc.send_clear_taint(pid) # Also flushes from eBPF ProcessMap
+
             time.sleep(2.0)
         
     def start(self):

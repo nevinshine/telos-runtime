@@ -120,7 +120,10 @@ class Guardian:
         for source_id, mapped_pid in list(self.view_agent_map.items()):
             if mapped_pid == pid:
                 del self.view_agent_map[source_id]
-        
+
+        if pid in self.core_taint:
+            del self.core_taint[pid]
+            
         log.info(f"[-] Agent unregistered: PID {pid}")
         return True
     
@@ -172,6 +175,8 @@ class Guardian:
         """Reset taint level for an agent (after cooldown/verification)."""
         if pid in self.agents:
             self.agents[pid].taint_level = 0
+            if pid in self.core_taint:
+                self.core_taint[pid] = 0
             log.info(f"Taint cleared for agent {pid}")
     
     # === PID BRIDGE ===
