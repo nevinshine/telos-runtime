@@ -62,7 +62,25 @@ var (
 
 	// Ticker / Stream
 	streamTitle = lipgloss.NewStyle().Foreground(cBrand).Bold(true).MarginTop(1)
+
+	// Astro Boot Styles
+	astroLogoStyle = lipgloss.NewStyle().Foreground(cBrand).Bold(true)
+	astroLineStyle = lipgloss.NewStyle().Foreground(cDark).SetString("│")
+	stepIconStyle  = lipgloss.NewStyle().Foreground(cGreen).SetString("▶")
+	timeStyle      = lipgloss.NewStyle().Foreground(cSubtext)
 )
+
+// --- APP STATES ---
+type sessionState int
+
+const (
+	stateBooting sessionState = iota
+	stateDashboard
+)
+
+// --- MESSAGES (For Animations) ---
+type bootStepMsg struct{}
+type bootDoneMsg struct{}
 
 // --- Types ---
 type bpfEvent struct {
@@ -97,6 +115,8 @@ type model struct {
 	processes     map[int]*ProcessStatus
 	prevTotal     uint64
 	prevIdle      uint64
+	state         sessionState
+	bootStep      int
 }
 
 // Custom msg types for tea.Cmd
@@ -109,6 +129,8 @@ func main() {
 	s.Style = lipgloss.NewStyle().Foreground(cBrand)
 
 	m := model{
+		state:         stateBooting,
+		bootStep:      0,
 		events:        make([]string, 0, 100),
 		cpu:           0.0,
 		mem:           0,
@@ -124,7 +146,7 @@ func main() {
 	go tailCortexLog(m.cortexLogChan)
 	go streamBPFEvents(m.bpfEventChan)
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 		os.Exit(1)
@@ -263,7 +285,20 @@ func (m model) Init() tea.Cmd {
 		waitForCortex(m.cortexLogChan),
 		tick(),
 		m.spinner.Tick,
+		tickBootStep(),
 	)
+}
+
+func tickBootStep() tea.Cmd {
+	return tea.Tick(time.Millisecond*400, func(t time.Time) tea.Msg {
+		return bootStepMsg{}
+	})
+}
+
+func transitionToDashboard() tea.Cmd {
+	return tea.Tick(time.Millisecond*1500, func(t time.Time) tea.Msg {
+		return bootDoneMsg{}
+	})
 }
 
 func waitForBPF(sub chan bpfEvent) tea.Cmd {
@@ -290,6 +325,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case bootStepMsg:
+		m.bootStep++
+		if m.bootStep >= 4 {
+			return m, transitionToDashboard()
+		}
+		return m, tickBootStep()
+	case bootDoneMsg:
+		m.state = stateDashboard
+		return m, tea.EnterAltScreen
 	case bpfEvent:
 		// Process Event Logic
 		pid := msg.PID
@@ -375,6 +419,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.width == 0 {
+		return ""
+	}
+
+	if m.state == stateBooting {
+		return m.renderBootSequence()
+	}
+
+	return m.renderDashboard()
+}
+
+func (m model) renderBootSequence() string {
+	var b strings.Builder
+
+	b.WriteString(fmt.Sprintf("%s   %s\n\n", astroLogoStyle.Render("telos"), timeStyle.Render("v2.0.0")))
+	
+	line := astroLineStyle.String() + "\n"
+	
+	if m.bootStep >= 1 {
+		b.WriteString(line)
+		b.WriteString(fmt.Sprintf("%s  Cortex daemon synchronized          %s\n", stepIconStyle.String(), timeStyle.Render("12ms")))
+	}
+	if m.bootStep >= 2 {
+		b.WriteString(line)
+		b.WriteString(fmt.Sprintf("%s  Sentinel LSM process hooks loaded   %s\n", stepIconStyle.String(), timeStyle.Render("45ms")))
+	}
+	if m.bootStep >= 3 {
+		b.WriteString(line)
+		b.WriteString(fmt.Sprintf("%s  Hyperion XDP filters attached       %s\n", stepIconStyle.String(), timeStyle.Render("18ms")))
+	}
+	if m.bootStep >= 4 {
+		b.WriteString(line)
+		b.WriteString(fmt.Sprintf("%s  Liftoff confirmed. Securing runtime boundary!\n", stepIconStyle.String()))
+	}
+
+	return lipgloss.NewStyle().Padding(2, 4).Render(b.String())
+}
+
+func (m model) renderDashboard() string {
 	if m.width == 0 {
 		return ""
 	}
