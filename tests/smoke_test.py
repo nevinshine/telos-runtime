@@ -607,8 +607,8 @@ def test_phase6_heki():
          f"enabled={status.get('enabled')}")
     test("Heki status has 'connected' field", "connected" in status)
 
-    # LOAD_SANDBOX — with the telosc-compiled ELF if available
-    sandbox_path = str(PROJECT_DIR.parent / "telos-lang" / "telosc" / "bpf_sandbox.o")
+    # LOAD_SANDBOX — with the mock BPF ELF
+    sandbox_path = str(PROJECT_DIR / "tests" / "mock_bpf_sandbox.o")
     if os.path.exists(sandbox_path):
         r, ms = timed(lambda: ipc("LOAD_SANDBOX",
                                    {"elf_path": sandbox_path}))

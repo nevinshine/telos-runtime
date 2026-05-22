@@ -151,6 +151,7 @@ When the Domain Intelligence Engine denies a domain, Telos resolves the underlyi
 | Fail-Open/Closed Watchdog | Bidirectional heartbeat between eBPF and Cortex planes |
 | Prometheus Metrics | Enterprise-grade observability on `:9094/metrics` |
 | Hyperion XDP Bridge | Malicious IPs pushed to XDP for wire-speed packet drops |
+| Sentinel Heki | Hypervisor-Enforced Kernel Integrity for hardware-level BPF map protection |
 
 ---
 
@@ -418,6 +419,16 @@ telos-runtime/
 - Telos Domain Intelligence pushes malicious IPs to Hyperion XDP via HTTP RPC
 - Hyperion `blacklist_map` drops packets at NIC level with `XDP_DROP`
 - Wire-speed enforcement — packets killed before reaching the network stack
+
+</details>
+
+<details>
+<summary><b>Phase 14: Sentinel Heki Integration (Ring -1)</b></summary>
+
+- Established Hypervisor-Enforced Kernel Integrity (Heki) via a cross-layer IPC bridge (`/tmp/heki.sock`)
+- `telos_core` dynamically leaks the Guest Virtual Addresses (GVA) of critical BPF maps to `sentinel-vmi`
+- The VMI hypervisor performs page-table walks using the guest's `CR3` (`init_mm.pgd`) to resolve physical addresses
+- Maps are enforced using hardware Extended Page Tables (EPT/NPT) write-protection, blocking root-level kernel tampering
 
 </details>
 

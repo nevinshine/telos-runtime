@@ -252,6 +252,9 @@ func init() {
 	prometheus.MustRegister(metricMirageFeeds)
 	prometheus.MustRegister(metricXdpDrops)
 	prometheus.MustRegister(metricMapUtilization)
+	metricMapUtilization.WithLabelValues("process_map").Set(0)
+	metricMapUtilization.WithLabelValues("network_map").Set(0)
+	metricMapUtilization.WithLabelValues("inode_map").Set(0)
 }
 
 func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
@@ -363,6 +366,16 @@ func (d *TelosDaemon) loadBPF() error {
 	spec, err := ebpf.LoadCollectionSpec(d.bpfObjPath)
 	if err != nil {
 		return fmt.Errorf("load collection spec: %w", err)
+	}
+
+	// [Phase 6] Force Array maps to be MMAPABLE so the kernel allocates them
+	// via vmalloc, guaranteeing they start perfectly aligned on a 4KB page
+	// boundary and do not share physical pages with other slab objects.
+	for _, mSpec := range spec.Maps {
+		if mSpec.Type == ebpf.Array {
+			// BPF_F_MMAPABLE = 1 << 10
+			mSpec.Flags |= 1 << 10
+		}
 	}
 
 	// Load into kernel

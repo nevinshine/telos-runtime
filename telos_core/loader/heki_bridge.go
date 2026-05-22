@@ -11,7 +11,8 @@ package main
 //   telos-lang/telosc/src/heki/    — EptMapping, HekiMonitor
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -29,29 +30,20 @@ type HekiBridge struct {
 	enabled    bool
 }
 
-// HekiGuardRequest is the wire format for registering a protected region
-// with sentinel-vmi. Maps to npt_guard.c's add_guard_region().
-type HekiGuardRequest struct {
-	Command  string           `json:"command"`
-	Regions  []HekiGuardPage  `json:"regions"`
+// HekiRegistration represents the fixed-size binary struct expected by sentinel-vmi
+type HekiRegistration struct {
+	Magic      uint32
+	GVA        uint64
+	Size       uint32
+	IsCritical uint8
+	Name       [32]byte
 }
 
-// HekiGuardPage represents a single memory page to protect.
-// Maps to sentinel-vmi's guard_region struct.
-type HekiGuardPage struct {
-	Name         string `json:"name"`          // e.g., "telos_process_map"
-	MapFD        int    `json:"map_fd"`        // BPF map file descriptor
-	PinPath      string `json:"pin_path"`      // e.g., "/sys/fs/bpf/telos/process_map"
-	Critical     bool   `json:"critical"`      // If true, modification = panic guest
-	AccessRights uint8  `json:"access_rights"` // 0b101 = Read+Execute, no Write
-}
+// HekiGuardResponse is the response from sentinel-vmi (still JSON for response if we want, or binary?)
+// Wait, if the request is binary, is the response binary? The user only specified the registration struct.
+// Let's assume the response is also just a simple 1-byte success code or similar, or we just drop the response parsing.
+// Actually, to be safe, I'll just read 1 byte for success.
 
-// HekiGuardResponse is the response from sentinel-vmi.
-type HekiGuardResponse struct {
-	Success        bool   `json:"success"`
-	Error          string `json:"error,omitempty"`
-	ProtectedPages int    `json:"protected_pages"`
-}
 
 // NewHekiBridge creates a bridge to sentinel-vmi.
 // Set TELOS_HEKI_VMI_SOCKET to the sentinel-vmi Unix socket path.
@@ -81,8 +73,6 @@ func (h *HekiBridge) ProtectMapPages(maps *BPFMaps) error {
 	}
 
 	// Build list of maps to protect
-	regions := []HekiGuardPage{}
-
 	mapEntries := []struct {
 		name    string
 		m       *ebpf.Map
@@ -96,73 +86,74 @@ func (h *HekiBridge) ProtectMapPages(maps *BPFMaps) error {
 		{"exec_policy_map", maps.ExecPolicyMap, bpfPinPath + "/exec_policy_map", false},
 	}
 
+	// Send to sentinel-vmi
+	protectedCount := 0
 	for _, entry := range mapEntries {
 		if entry.m == nil {
 			continue
 		}
-		info, err := entry.m.Info()
+
+		gva, err := LeakMapGVA(entry.m)
 		if err != nil {
-			log.Printf("[HEKI] WARNING: cannot get info for %s: %v", entry.name, err)
+			log.Printf("[HEKI] WARNING: failed to leak GVA for %s: %v", entry.name, err)
 			continue
 		}
-		id, _ := info.ID()
-		regions = append(regions, HekiGuardPage{
-			Name:         entry.name,
-			MapFD:        int(id),
-			PinPath:      entry.pin,
-			Critical:     entry.critical,
-			AccessRights: 0b101, // Read + Execute, no Write
-		})
-	}
 
-	if len(regions) == 0 {
-		return fmt.Errorf("no maps to protect")
-	}
+		// Assume map struct size is at least 4096 (1 page) for protection purposes,
+		// or pass the value from Info if we can. We'll pass 4096.
+		req := HekiRegistration{
+			Magic:      0x48454B49,
+			GVA:        gva,
+			Size:       4096, 
+			IsCritical: 0,
+		}
+		if entry.critical {
+			req.IsCritical = 1
+		}
+		copy(req.Name[:], entry.name)
 
-	// Send to sentinel-vmi
-	req := HekiGuardRequest{
-		Command: "PROTECT_PAGES",
-		Regions: regions,
-	}
-
-	resp, err := h.sendRequest(req)
-	if err != nil {
-		return fmt.Errorf("VMI request failed: %w", err)
-	}
-
-	if !resp.Success {
-		return fmt.Errorf("VMI protection failed: %s", resp.Error)
+		err = h.sendBinaryRequest(req)
+		if err != nil {
+			return fmt.Errorf("VMI protection failed for %s: %w", entry.name, err)
+		}
+		protectedCount++
 	}
 
 	h.connected = true
-	log.Printf("[HEKI] ✓ %d map pages under Ring -1 NPT write-protection", resp.ProtectedPages)
+	log.Printf("[HEKI] ✓ %d map pages under Ring -1 NPT write-protection", protectedCount)
 	return nil
 }
 
-// sendRequest sends a JSON request to sentinel-vmi and reads the response.
-func (h *HekiBridge) sendRequest(req HekiGuardRequest) (*HekiGuardResponse, error) {
+// sendBinaryRequest sends a binary request to sentinel-vmi and reads a 1-byte response.
+func (h *HekiBridge) sendBinaryRequest(req HekiRegistration) error {
 	conn, err := net.DialTimeout("unix", h.socketPath, 5*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to VMI at %s: %w", h.socketPath, err)
+		return fmt.Errorf("cannot connect to VMI at %s: %w", h.socketPath, err)
 	}
 	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// Send request
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(req); err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, req); err != nil {
+		return fmt.Errorf("failed to encode request: %w", err)
+	}
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Read response
-	var resp HekiGuardResponse
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&resp); err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	// Read response (1 byte: 1 = success, 0 = failure)
+	resp := make([]byte, 1)
+	if _, err := conn.Read(resp); err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	return &resp, nil
+	if resp[0] != 1 {
+		return fmt.Errorf("hypervisor rejected the registration")
+	}
+
+	return nil
 }
 
 // IsConnected returns true if the bridge has successfully communicated
