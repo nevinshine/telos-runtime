@@ -1,0 +1,17 @@
+[project]
+name = "telos-runtime"
+version = "0.5.0"
+description = "Telos Runtime Security Engine"
+authors = [
+    { name = "Nevin Shine", email = "nevin@example.com" }
+]
+dependencies = [
+    "rich>=13.0.0",
+    "textual>=0.40.0",
+    "grpcio>=1.50.0",
+    "grpcio-tools>=1.50.0",
+    "protobuf>=4.21.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0"
+]
+requires-python = ">=3.10"

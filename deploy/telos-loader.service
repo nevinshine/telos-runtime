@@ -6,11 +6,22 @@ After=network.target
 Type=simple
 # Must run as root to load eBPF programs into the kernel
 User=root
-WorkingDirectory=/home/nevinshine/code/telos-runtime
-ExecStart=/home/nevinshine/code/telos-runtime/bin/telos_daemon --socket /var/run/telos.sock
+WorkingDirectory=/home/nevin/telos-runtime
+ExecStart=/home/nevin/telos-runtime/bin/telos_daemon --socket /var/run/telos.sock
 
-Restart=on-failure
-RestartSec=5
+# --- Production Hardening & Resource Limits ---
+# Required for loading BPF maps in older kernels
+LimitMEMLOCK=infinity
+# Required for high-throughput XDP socket events
+LimitNOFILE=1048576
+
+# CGroup Limits to prevent host starvation
+MemoryMax=250M
+CPUQuota=20%
+
+# Aggressive restart policy for fail-safe recovery
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

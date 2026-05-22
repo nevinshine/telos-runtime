@@ -6,14 +6,19 @@ Requires=telos-loader.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/nevinshine/code/telos-runtime
-Environment="PATH=/home/nevinshine/code/telos-runtime/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+WorkingDirectory=/home/nevin/telos-runtime
+Environment="PATH=/home/nevin/telos-runtime/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Set this in production through a systemd drop-in or EnvironmentFile.
 # Environment="TELOS_CORTEX_AUTH_TOKEN=replace-with-a-long-random-token"
-ExecStart=/home/nevinshine/code/telos-runtime/.venv/bin/python3 /home/nevinshine/code/telos-runtime/cortex/main.py
+ExecStart=/home/nevin/telos-runtime/.venv/bin/python3 /home/nevin/telos-runtime/cortex/main.py
 
-Restart=on-failure
-RestartSec=5
+# --- Production Hardening & Resource Limits ---
+MemoryMax=500M
+CPUQuota=40%
+
+# Aggressive restart policy for fail-safe recovery
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

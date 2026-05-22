@@ -12,6 +12,7 @@ Protocol:
 import json
 import socket
 import logging
+import threading
 from typing import Optional, Dict, Any
 
 log = logging.getLogger('telos.ipc')
@@ -34,6 +35,7 @@ class CoreIPCClient:
         self.socket_path = socket_path
         self.sock: Optional[socket.socket] = None
         self.connected = False
+        self._lock = threading.Lock()
     
     def connect(self) -> bool:
         """
@@ -99,28 +101,35 @@ class CoreIPCClient:
             
             # Send as JSON + newline
             payload = json.dumps(message) + '\n'
-            self.sock.sendall(payload.encode('utf-8'))
-            log.debug(f"Sent: {command} -> {data}")
             
-            # Read response
-            self.sock.settimeout(READ_TIMEOUT)
-            response_data = b''
-            
-            while True:
-                chunk = self.sock.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b'\n' in chunk:
-                    break
-            
-            if response_data:
-                response = json.loads(response_data.decode('utf-8').strip())
-                log.debug(f"Received: {response}")
-                return response
-            else:
-                log.warning("Empty response from Core")
-                return None
+            with self._lock:
+                # Re-check connection inside lock just in case it dropped
+                if not self.connected:
+                    if not self.connect():
+                        return None
+                        
+                self.sock.sendall(payload.encode('utf-8'))
+                log.debug(f"Sent: {command} -> {data}")
+                
+                # Read response
+                self.sock.settimeout(READ_TIMEOUT)
+                response_data = b''
+                
+                while True:
+                    chunk = self.sock.recv(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                    if b'\n' in chunk:
+                        break
+                
+                if response_data:
+                    response = json.loads(response_data.decode('utf-8').strip())
+                    log.debug(f"Received: {response}")
+                    return response
+                else:
+                    log.warning("Empty response from Core")
+                    return None
                 
         except socket.timeout:
             log.error("Core response timeout")

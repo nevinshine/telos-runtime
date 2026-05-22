@@ -111,7 +111,7 @@ class Guardian:
 
         log.info(f"[+] Agent registered: PID {pid}")
         return True
-    
+
     def unregister_agent(self, pid: int, *, cleanup_taint_records: bool = True) -> bool:
         """Unregister an agent when it exits.
 
@@ -160,7 +160,7 @@ class Guardian:
 
             # 5. Update active agent using explicit registration order
             if self._active_agent_pid == pid:
-                if self._agents:
+                if self._registration_order:
                     self._active_agent_pid = self._registration_order[-1]
                 else:
                     self._active_agent_pid = None
@@ -229,7 +229,7 @@ class Guardian:
                 self._agents[pid].taint_level = 0
                 self._core_taint.pop(pid, None)
                 log.info(f"Taint cleared for agent {pid}")
-    
+
     # === PID BRIDGE ===
 
     def get_agent_pid_for_view(self, source_id: str, session_id: str = "") -> Optional[int]:
@@ -245,7 +245,7 @@ class Guardian:
             return self._get_agent_pid_for_view_unlocked(source_id, session_id)
 
     def _get_agent_pid_for_view_unlocked(self, source_id: str, session_id: str = "") -> Optional[int]:
-        """Internal unlocked version � caller must hold self._lock."""
+        """Internal unlocked version — caller must hold self._lock."""
         # 1. Session ID (Strongest Link)
         if session_id and session_id in self._session_map:
             pid = self._session_map[session_id]
@@ -361,4 +361,3 @@ class Guardian:
         """Return a thread-safe shallow copy of the session map."""
         with self._lock:
             return dict(self._session_map)
-
