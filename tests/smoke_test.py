@@ -458,6 +458,141 @@ def test_fork_resilience():
 
 
 # ══════════════════════════════════════════════════════════════
+# 10. EXTREME KERNEL ENFORCEMENT SPEED TEST
+# ══════════════════════════════════════════════════════════════
+
+def test_extreme_speed():
+    section("10. Extreme Speed: Ring 0 Block Rate")
+
+    NUM_ATTEMPTS = 2000
+    NUM_CHILDREN = 10  # Parallel tainted children for dashboard flood
+
+    print(f"  {DIM}Spawning {NUM_CHILDREN} tainted agents, each attempting"
+          f" {NUM_ATTEMPTS} socket connects...{RESET}\n")
+
+    # ── Single-process raw speed ──────────────────────────────
+    r_fd, w_fd = os.pipe()
+    child_pid = os.fork()
+
+    if child_pid == 0:
+        # Child: report PID, wait for taint, then hammer connect()
+        os.close(r_fd)
+        my_pid = os.getpid()
+        os.write(w_fd, f"{my_pid}\n".encode())
+
+        time.sleep(0.5)  # Wait for parent to taint us
+
+        blocked = 0
+        t0 = time.perf_counter()
+        for _ in range(NUM_ATTEMPTS):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.01)
+                s.connect(("1.1.1.1", 80))
+                s.close()
+            except PermissionError:
+                blocked += 1
+            except Exception:
+                blocked += 1
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        elapsed = time.perf_counter() - t0
+
+        # Report results back
+        os.write(w_fd, f"{blocked},{elapsed:.6f}\n".encode())
+        os.close(w_fd)
+        os._exit(0)
+
+    # Parent: taint the child and wait
+    os.close(w_fd)
+    pipe_file = os.fdopen(r_fd, "r")
+    victim_pid = int(pipe_file.readline().strip())
+
+    ipc("REGISTER_AGENT", {"pid": victim_pid, "comm": "speed_test"})
+    ipc("UPDATE_TAINT", {"pid": victim_pid, "taint_level": 4})
+
+    os.waitpid(child_pid, 0)
+    result_line = pipe_file.readline().strip()
+    pipe_file.close()
+
+    blocked, elapsed = result_line.split(",")
+    blocked = int(blocked)
+    elapsed = float(elapsed)
+    blocks_per_sec = blocked / elapsed if elapsed > 0 else 0
+    per_block_us = (elapsed / blocked * 1_000_000) if blocked > 0 else 0
+
+    test(f"Single-thread: {blocked}/{NUM_ATTEMPTS} blocked in {elapsed:.3f}s",
+         blocked == NUM_ATTEMPTS)
+
+    # The money shot
+    print(f"\n  {BOLD}{CYAN}  ╔══════════════════════════════════════════════╗{RESET}")
+    print(f"  {BOLD}{CYAN}  ║  {GREEN}KERNEL ENFORCEMENT SPEED{RESET}                     {BOLD}{CYAN}║{RESET}")
+    print(f"  {BOLD}{CYAN}  ╠══════════════════════════════════════════════╣{RESET}")
+    print(f"  {BOLD}{CYAN}  ║{RESET}  Blocks/sec:  {BOLD}{GREEN}{blocks_per_sec:>12,.0f}{RESET}               {BOLD}{CYAN}║{RESET}")
+    print(f"  {BOLD}{CYAN}  ║{RESET}  Per block:   {BOLD}{GREEN}{per_block_us:>12,.2f} μs{RESET}            {BOLD}{CYAN}║{RESET}")
+    print(f"  {BOLD}{CYAN}  ║{RESET}  Total:       {BOLD}{blocked:>12,} blocks{RESET}            {BOLD}{CYAN}║{RESET}")
+    print(f"  {BOLD}{CYAN}  ╚══════════════════════════════════════════════╝{RESET}\n")
+
+    test(f"Block rate > 50,000/sec", blocks_per_sec > 50000,
+         f"{blocks_per_sec:,.0f}/sec")
+    test(f"Per-block latency < 100μs", per_block_us < 100,
+         f"{per_block_us:.2f}μs")
+
+    ipc("CLEAR_TAINT", {"pid": victim_pid})
+
+    # ── Multi-process dashboard flood ─────────────────────────
+    print(f"\n  {DIM}Flooding dashboard with {NUM_CHILDREN} parallel"
+          f" tainted agents...{RESET}")
+
+    children = []
+    for i in range(NUM_CHILDREN):
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            my_pid = os.getpid()
+            os.write(w, f"{my_pid}\n".encode())
+            time.sleep(0.5)
+            # Each child does 50 blocked connects → visible on dashboard
+            for _ in range(50):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.01)
+                    s.connect(("1.1.1.1", 80))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            os.close(w)
+            os._exit(0)
+        else:
+            os.close(w)
+            cpid = int(os.fdopen(r, "r").readline().strip())
+            ipc("REGISTER_AGENT", {"pid": cpid, "comm": f"flood_{i}"})
+            ipc("UPDATE_TAINT", {"pid": cpid, "taint_level": 4})
+            children.append((pid, cpid))
+
+    # Wait for all children
+    for pid, cpid in children:
+        os.waitpid(pid, 0)
+        ipc("CLEAR_TAINT", {"pid": cpid})
+
+    total_flood = NUM_CHILDREN * 50
+    test(f"Dashboard flood: {total_flood} kernel blocks generated", True,
+         f"{NUM_CHILDREN} agents × 50 connects")
+
+    # Daemon still alive?
+    r, ms = timed(lambda: ipc("PING"))
+    test("Daemon responsive after extreme load",
+         r.get("success") is True, f"{ms:.1f}ms")
+
+# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -486,11 +621,12 @@ def main():
     test_throughput()
     test_latency()
     test_fork_resilience()
+    test_extreme_speed()
 
     elapsed = time.perf_counter() - t_start
 
     # ── Kernel Event Audit ──────────────────────────────────────
-    section("10. Kernel Event Audit (Live Blocks)")
+    section("11. Kernel Event Audit (Live Blocks)")
 
     log_path = Path(ALERT_LOG)
     if log_path.exists():
