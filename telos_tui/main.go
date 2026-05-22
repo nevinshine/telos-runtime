@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -80,6 +81,7 @@ type model struct {
 	lsmHooks      int
 	bpfEventChan  chan string
 	cortexLogChan chan string
+	spinner       spinner.Model
 }
 
 // Custom msg types for tea.Cmd
@@ -88,6 +90,10 @@ type cortexMsg string
 type tickMsg time.Time
 
 func main() {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(cBrand)
+
 	m := model{
 		events:        make([]string, 0, 100),
 		cpu:           42.0,
@@ -96,6 +102,7 @@ func main() {
 		lsmHooks:      402,
 		bpfEventChan:  make(chan string, 100),
 		cortexLogChan: make(chan string, 100),
+		spinner:       s,
 	}
 
 	// Start background workers
@@ -176,6 +183,7 @@ func (m model) Init() tea.Cmd {
 		waitForBPF(m.bpfEventChan),
 		waitForCortex(m.cortexLogChan),
 		tick(),
+		m.spinner.Tick,
 	)
 }
 
@@ -220,6 +228,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Mock stats update
 		return m, tick()
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 	return m, nil
 }
@@ -260,18 +272,46 @@ func (m model) View() string {
 	cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, sysCard, "  ", netCard, "  ", lsmCard)
 
 	// 3. THREAT ARENA (Process Table)
-	arenaHead := fmt.Sprintf(" %s %s", arenaTitle.Render("THREAT ARENA"), arenaLine.Render(strings.Repeat("┈", 65)))
+	arenaHead := fmt.Sprintf(" %s %s", arenaTitle.Render("THREAT ARENA"), arenaLine.Render(strings.Repeat("┈", 70)))
 
-	table := fmt.Sprintf(`  PID      TARGET         INTEGRITY       STATE                ACTION
-  1042     nginx          %s      %s         [ ALLOW ]
-  3391     node           %s      %s         [ ALLOW ]
-  8991   %s bash           %s       %s      [ BLOCKED ]
-           └─► SECCOMP: sys_socket (TCP OUTBOUND)
-           └─► LSM: bpf_file_open (signature match)`,
-		safeText.Render("✓ Verified"), safeText.Render("🟢 LISTENING"),
-		safeText.Render("✓ Verified"), safeText.Render("🟢 LISTENING"),
-		headerStyle.Render("❯"), alertText.Render("✗ TAINTED "), alertText.Render("🔴 EXFILTRATING"),
-	)
+	colPID := lipgloss.NewStyle().Width(8)
+	colTarget := lipgloss.NewStyle().Width(14)
+	colIntegrity := lipgloss.NewStyle().Width(15)
+	colState := lipgloss.NewStyle().Width(20)
+	colAction := lipgloss.NewStyle().Width(12)
+
+	headerTable := lipgloss.JoinHorizontal(lipgloss.Left, 
+		colPID.Render("PID"), 
+		colTarget.Render("TARGET"), 
+		colIntegrity.Render("INTEGRITY"), 
+		colState.Render("STATE"), 
+		colAction.Render("ACTION"))
+	
+	r1 := lipgloss.JoinHorizontal(lipgloss.Left, 
+		colPID.Render("1042"), 
+		colTarget.Render("nginx"), 
+		colIntegrity.Render(safeText.Render("✓ Verified")), 
+		colState.Render(safeText.Render("🟢 LISTENING")), 
+		colAction.Render("[ ALLOW ]"))
+	
+	r2 := lipgloss.JoinHorizontal(lipgloss.Left, 
+		colPID.Render("3391"), 
+		colTarget.Render("node"), 
+		colIntegrity.Render(safeText.Render("✓ Verified")), 
+		colState.Render(safeText.Render("🟢 LISTENING")), 
+		colAction.Render("[ ALLOW ]"))
+
+	r3 := lipgloss.JoinHorizontal(lipgloss.Left, 
+		colPID.Render(headerStyle.Render("❯") + " 8991"), 
+		colTarget.Render("bash"), 
+		colIntegrity.Render(alertText.Render("✗ TAINTED")), 
+		colState.Render(alertText.Render("🔴 EXFILTRATING")), 
+		colAction.Render("[ BLOCKED ]"))
+	
+	r4 := "         └─► SECCOMP: sys_socket (TCP OUTBOUND)"
+	r5 := "         └─► LSM: bpf_file_open (signature match)"
+
+	table := lipgloss.JoinVertical(lipgloss.Left, "  " + headerTable, "  " + r1, "  " + r2, "  " + r3, r4, r5)
 
 	// 4. LIVE TICKER
 	tickerContent := ""
@@ -289,8 +329,9 @@ func (m model) View() string {
 		tickerContent = dimText.Render("Waiting for live trace events...")
 	}
 
-	ticker := fmt.Sprintf("%s  %s",
-		tickerPrefix.Render("LIVE ❯"),
+	ticker := fmt.Sprintf("%s %s  %s",
+		tickerPrefix.Render("LIVE"),
+		m.spinner.View(),
 		tickerContent,
 	)
 
