@@ -184,7 +184,7 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         if not session_id:
             return
 
-        mapped_pid = self.guardian.session_map.get(session_id)
+        mapped_pid = self.guardian.get_session_pid(session_id)
         if mapped_pid is not None and mapped_pid != pid:
             _context_abort(
                 context,
@@ -218,7 +218,7 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 request.session_id  # [NEW] Pass session ID for PID resolution
             )
             # 2. Resolve Agent PID (PID Bridge logic)
-            agent_pid = self.guardian.get_agent_pid_for_view(request.source_id)
+            agent_pid = self.guardian.get_agent_pid_for_view(request.source_id, request.session_id)
             
             if agent_pid is None:
                 log.warning(f"No agent registered for source {request.source_id}")
@@ -448,7 +448,7 @@ class CortexServer:
             sweep_counter += 1
             if sweep_counter >= 10:
                 sweep_counter = 0
-                dead_pids = [pid for pid in list(self.guardian.agents.keys()) if not _pid_exists(pid)]
+                dead_pids = [pid for pid in self.guardian.get_agent_pids() if not _pid_exists(pid)]
                 for pid in dead_pids:
                     self.guardian.unregister_agent(pid)
                     if self.ipc and self.ipc.connected:
