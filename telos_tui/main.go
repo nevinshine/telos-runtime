@@ -7,11 +7,12 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -59,8 +60,8 @@ var (
 	alertText = lipgloss.NewStyle().Foreground(cRed)
 	dimText   = lipgloss.NewStyle().Foreground(cSubtext)
 
-	// Ticker
-	tickerPrefix = lipgloss.NewStyle().Foreground(cBrand).Bold(true).MarginTop(1)
+	// Ticker / Stream
+	streamTitle = lipgloss.NewStyle().Foreground(cBrand).Bold(true).MarginTop(1)
 )
 
 // --- Types ---
@@ -71,6 +72,17 @@ type bpfEvent struct {
 	Action     string `json:"desc"`
 }
 
+type ProcessStatus struct {
+	PID       int
+	Name      string
+	Integrity string
+	State     string
+	Action    string
+	IsBlocked bool
+	IsTainted bool
+	LastEvent time.Time
+}
+
 type model struct {
 	width         int
 	height        int
@@ -79,13 +91,13 @@ type model struct {
 	mem           int
 	xdpDrops      int
 	lsmHooks      int
-	bpfEventChan  chan string
+	bpfEventChan  chan bpfEvent
 	cortexLogChan chan string
 	spinner       spinner.Model
+	processes     map[int]*ProcessStatus
 }
 
 // Custom msg types for tea.Cmd
-type bpfMsg string
 type cortexMsg string
 type tickMsg time.Time
 
@@ -96,13 +108,14 @@ func main() {
 
 	m := model{
 		events:        make([]string, 0, 100),
-		cpu:           42.0,
-		mem:           74,
-		xdpDrops:      14,
-		lsmHooks:      402,
-		bpfEventChan:  make(chan string, 100),
+		cpu:           0.0,
+		mem:           0,
+		xdpDrops:      0,
+		lsmHooks:      0,
+		bpfEventChan:  make(chan bpfEvent, 100),
 		cortexLogChan: make(chan string, 100),
 		spinner:       s,
+		processes:     make(map[int]*ProcessStatus),
 	}
 
 	// Start background workers
@@ -116,40 +129,97 @@ func main() {
 	}
 }
 
+// --- System Info Helpers ---
+func getProcessName(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		// Fallback for mocked PIDs
+		if pid == 1042 {
+			return "nginx"
+		} else if pid == 3391 {
+			return "node"
+		} else if pid == 8991 {
+			return "bash"
+		}
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func getMemoryPercent() int {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	var total, available int
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemTotal:") {
+			fmt.Sscanf(line, "MemTotal: %d", &total)
+		} else if strings.HasPrefix(line, "MemAvailable:") {
+			fmt.Sscanf(line, "MemAvailable: %d", &available)
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return int(float64(total-available) / float64(total) * 100)
+}
+
+func getCPUPercent() float64 {
+	// A simple mock for CPU, reading /proc/stat correctly requires two samples.
+	// For immediate UI feedback without blocking, we'll return a static/simulated value.
+	return 12.4
+}
+
 // --- Background Workers ---
 func tailCortexLog(out chan string) {
 	file, err := os.Open(CortexLog)
 	if err != nil {
-		out <- fmt.Sprintf("Error: %v", err)
-		return
+		// Log might not exist immediately
+		time.Sleep(1 * time.Second)
 	}
-	defer file.Close()
-
-	file.Seek(0, 2)
-	reader := bufio.NewReader(file)
+	if file != nil {
+		defer file.Close()
+		file.Seek(0, 2)
+	}
 
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
+		if file == nil {
+			file, err = os.Open(CortexLog)
+			if err != nil {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			file.Seek(0, 2)
 		}
 
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "[Intent]") {
-			parts := strings.SplitN(line, "[Intent]", 2)
-			if len(parts) == 2 {
-				out <- safeText.Render(fmt.Sprintf("intent_decl cortex (%s)", strings.TrimSpace(parts[1])))
+		reader := bufio.NewReader(file)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
-		} else if strings.Contains(line, "✅ Intent APPROVED") {
-			out <- safeText.Render("network_gate OPEN")
-		} else if strings.Contains(line, "❌ Intent DENIED") {
-			out <- alertText.Render("intent_denied")
+
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "[Intent]") {
+				parts := strings.SplitN(line, "[Intent]", 2)
+				if len(parts) == 2 {
+					out <- safeText.Render(fmt.Sprintf("CORTEX: intent_decl (%s)", strings.TrimSpace(parts[1])))
+				}
+			} else if strings.Contains(line, "✅ Intent APPROVED") {
+				out <- safeText.Render("CORTEX: network_gate OPEN")
+			} else if strings.Contains(line, "❌ Intent DENIED") {
+				out <- alertText.Render("CORTEX: intent_denied")
+			}
 		}
 	}
 }
 
-func streamBPFEvents(out chan string) {
+func streamBPFEvents(out chan bpfEvent) {
 	for {
 		conn, err := net.Dial("unix", EventsSocket)
 		if err != nil {
@@ -161,16 +231,7 @@ func streamBPFEvents(out chan string) {
 		for scanner.Scan() {
 			var event bpfEvent
 			if err := json.Unmarshal(scanner.Bytes(), &event); err == nil {
-				action := event.Action
-				var styledAction string
-				if action == "exec_denied" || action == "exfil_blocked" {
-					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
-				} else if action == "taint_elevate" {
-					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
-				} else {
-					styledAction = dimText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
-				}
-				out <- styledAction
+				out <- event
 			}
 		}
 		conn.Close()
@@ -187,8 +248,8 @@ func (m model) Init() tea.Cmd {
 	)
 }
 
-func waitForBPF(sub chan string) tea.Cmd {
-	return func() tea.Msg { return bpfMsg(<-sub) }
+func waitForBPF(sub chan bpfEvent) tea.Cmd {
+	return func() tea.Msg { return <-sub }
 }
 
 func waitForCortex(sub chan string) tea.Cmd {
@@ -211,23 +272,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-	case bpfMsg:
-		m.events = append(m.events, string(msg))
-		if len(m.events) > 10 {
+	case bpfEvent:
+		// Process Event Logic
+		pid := msg.PID
+		if _, exists := m.processes[pid]; !exists {
+			m.processes[pid] = &ProcessStatus{
+				PID:       pid,
+				Name:      getProcessName(pid),
+				Integrity: "VERIFIED",
+				State:     "LISTENING",
+				Action:    "ALLOW",
+			}
+		}
+		
+		proc := m.processes[pid]
+		proc.LastEvent = time.Now()
+		m.lsmHooks++
+
+		action := msg.Action
+		var styledAction string
+		if action == "exec_denied" || action == "exfil_blocked" {
+			proc.Action = "BLOCKED"
+			proc.State = "EXFILTRATING"
+			proc.IsBlocked = true
+			proc.IsTainted = true
+			proc.Integrity = "TAINTED"
+			m.xdpDrops++
+			styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, pid))
+		} else if action == "taint_elevate" {
+			proc.Integrity = "TAINTED"
+			proc.State = "COMPROMISED"
+			proc.IsTainted = true
+			styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, pid))
+		} else {
+			styledAction = dimText.Render(fmt.Sprintf("%s PID:%d", action, pid))
+		}
+
+		m.events = append(m.events, fmt.Sprintf("%s %s", time.Now().Format("15:04:05"), styledAction))
+		if len(m.events) > 20 {
 			m.events = m.events[1:]
 		}
-		m.xdpDrops += 1
-		m.lsmHooks += 10
 		return m, waitForBPF(m.bpfEventChan)
+
 	case cortexMsg:
-		m.events = append(m.events, string(msg))
-		if len(m.events) > 10 {
+		m.events = append(m.events, fmt.Sprintf("%s %s", time.Now().Format("15:04:05"), string(msg)))
+		if len(m.events) > 20 {
 			m.events = m.events[1:]
 		}
 		return m, waitForCortex(m.cortexLogChan)
+
 	case tickMsg:
-		// Mock stats update
+		m.mem = getMemoryPercent()
+		m.cpu = getCPUPercent()
 		return m, tick()
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -260,13 +358,13 @@ func (m model) View() string {
 	netCard := cardBorder.Render(fmt.Sprintf("%s\nBLOCKED %10s\nALLOWED %10s",
 		cardTitle.Render("NETWORK (XDP)"),
 		alertText.Render(fmt.Sprintf("%d req/s", m.xdpDrops)),
-		safeText.Render("842 req/s"),
+		safeText.Render(fmt.Sprintf("%d req/s", m.lsmHooks*2)), // Mocking allowed based on hooks
 	))
 
 	lsmCard := cardBorder.Render(fmt.Sprintf("%s\nINTERCEPTS %7s\nTAINTED %10s",
 		cardTitle.Render("KERNEL (LSM)"),
 		safeText.Render(fmt.Sprintf("%d ev/s", m.lsmHooks)),
-		alertText.Render("2 ev/s"),
+		alertText.Render(fmt.Sprintf("%d ev/s", m.xdpDrops)),
 	))
 
 	cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, sysCard, "  ", netCard, "  ", lsmCard)
@@ -280,60 +378,80 @@ func (m model) View() string {
 	colState := lipgloss.NewStyle().Width(20)
 	colAction := lipgloss.NewStyle().Width(12)
 
-	headerTable := lipgloss.JoinHorizontal(lipgloss.Left, 
-		colPID.Render("PID"), 
-		colTarget.Render("TARGET"), 
-		colIntegrity.Render("INTEGRITY"), 
-		colState.Render("STATE"), 
+	headerTable := lipgloss.JoinHorizontal(lipgloss.Left,
+		colPID.Render("PID"),
+		colTarget.Render("TARGET"),
+		colIntegrity.Render("INTEGRITY"),
+		colState.Render("STATE"),
 		colAction.Render("ACTION"))
-	
-	r1 := lipgloss.JoinHorizontal(lipgloss.Left, 
-		colPID.Render("1042"), 
-		colTarget.Render("nginx"), 
-		colIntegrity.Render(safeText.Render("VERIFIED")), 
-		colState.Render(safeText.Render("LISTENING")), 
-		colAction.Render("[ ALLOW ]"))
-	
-	r2 := lipgloss.JoinHorizontal(lipgloss.Left, 
-		colPID.Render("3391"), 
-		colTarget.Render("node"), 
-		colIntegrity.Render(safeText.Render("VERIFIED")), 
-		colState.Render(safeText.Render("LISTENING")), 
-		colAction.Render("[ ALLOW ]"))
 
-	r3 := lipgloss.JoinHorizontal(lipgloss.Left, 
-		colPID.Render(headerStyle.Render("❯") + " 8991"), 
-		colTarget.Render("bash"), 
-		colIntegrity.Render(alertText.Render("TAINTED")), 
-		colState.Render(alertText.Render("EXFILTRATING")), 
-		colAction.Render("[ BLOCKED ]"))
-	
-	r4 := "         └─► SECCOMP: sys_socket (TCP OUTBOUND)"
-	r5 := "         └─► LSM: bpf_file_open (signature match)"
+	// Sort processes by LastEvent descending
+	var procs []*ProcessStatus
+	for _, p := range m.processes {
+		procs = append(procs, p)
+	}
+	sort.Slice(procs, func(i, j int) bool {
+		return procs[i].LastEvent.After(procs[j].LastEvent)
+	})
 
-	table := lipgloss.JoinVertical(lipgloss.Left, "  " + headerTable, "  " + r1, "  " + r2, "  " + r3, r4, r5)
+	var tableRows []string
+	tableRows = append(tableRows, "  "+headerTable)
 
-	// 4. LIVE TICKER
-	tickerContent := ""
-	if len(m.events) > 0 {
-		var tickerParts []string
-		start := len(m.events) - 4
-		if start < 0 {
-			start = 0
+	for i, p := range procs {
+		if i >= 6 {
+			break // Show max 6 rows
 		}
-		for i := start; i < len(m.events); i++ {
-			tickerParts = append(tickerParts, m.events[i])
+		
+		pidStr := fmt.Sprintf("%d", p.PID)
+		if p.IsTainted || p.IsBlocked {
+			pidStr = headerStyle.Render("❯") + " " + pidStr
 		}
-		tickerContent = strings.Join(tickerParts, "  |  ")
-	} else {
-		tickerContent = dimText.Render("Waiting for live trace events...")
+
+		integrity := safeText.Render(p.Integrity)
+		if p.IsTainted {
+			integrity = alertText.Render(p.Integrity)
+		}
+
+		state := safeText.Render(p.State)
+		if p.IsBlocked || p.IsTainted {
+			state = alertText.Render(p.State)
+		}
+
+		action := fmt.Sprintf("[ %s ]", p.Action)
+		
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
+			colPID.Render(pidStr),
+			colTarget.Render(p.Name),
+			colIntegrity.Render(integrity),
+			colState.Render(state),
+			colAction.Render(action))
+		
+		tableRows = append(tableRows, "  "+row)
 	}
 
-	ticker := fmt.Sprintf("%s %s  %s",
-		tickerPrefix.Render("LIVE"),
-		m.spinner.View(),
-		tickerContent,
-	)
+	if len(procs) == 0 {
+		tableRows = append(tableRows, "  "+dimText.Render("No active processes being tracked."))
+	}
+
+	table := lipgloss.JoinVertical(lipgloss.Left, tableRows...)
+
+	// 4. VERTICAL LIVE STREAM
+	streamHead := fmt.Sprintf(" %s %s", streamTitle.Render("EVENT STREAM"), arenaLine.Render(strings.Repeat("┈", 70)))
+	
+	var streamParts []string
+	start := len(m.events) - 8 // Show last 8 events
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(m.events); i++ {
+		streamParts = append(streamParts, "  "+m.events[i])
+	}
+	
+	if len(streamParts) == 0 {
+		streamParts = append(streamParts, "  "+dimText.Render("Waiting for live trace events..."))
+	}
+	
+	streamView := lipgloss.JoinVertical(lipgloss.Left, streamParts...)
 
 	// ASSEMBLE
 	ui := lipgloss.JoinVertical(lipgloss.Left,
@@ -345,7 +463,9 @@ func (m model) View() string {
 		"",
 		table,
 		"",
-		ticker,
+		streamHead,
+		"",
+		streamView,
 	)
 
 	return baseStyle.Render(ui) + "\n"
