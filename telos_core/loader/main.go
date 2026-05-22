@@ -958,7 +958,9 @@ func (d *TelosDaemon) cmdUpdateNetwork(data map[string]interface{}) IPCResponse 
 		return IPCResponse{Success: false, Error: err.Error()}
 	}
 
-	metricActiveDrawbridges.Inc()
+	if allowed == 1 {
+		metricActiveDrawbridges.Inc()
+	}
 
 	log.Printf("[NETWORK] Updated IP %d -> allowed %d", ip, allowed)
 	return IPCResponse{Success: true}
@@ -973,11 +975,19 @@ func (d *TelosDaemon) cmdDeleteNetwork(data map[string]interface{}) IPCResponse 
 	ip := uint32(ipFloat)
 
 	// Delete the key from the map
+	// Check if entry was an allowed drawbridge before deleting
+	var existing NetworkPolicy
+	wasAllowed := false
+	if err := d.maps.NetworkMap.Lookup(ip, &existing); err == nil {
+		wasAllowed = existing.Allowed == 1
+	}
+
 	if err := d.maps.NetworkMap.Delete(ip); err != nil {
-		// It's not an error if the key doesn't exist (already deleted)
 		log.Printf("[NETWORK] Warning: Failed to delete IP %d: %v", ip, err)
 	} else {
-		metricActiveDrawbridges.Dec()
+		if wasAllowed {
+			metricActiveDrawbridges.Dec()
+		}
 		log.Printf("[NETWORK] Deleted IP %d (Rule Expired)", ip)
 	}
 
@@ -1294,9 +1304,12 @@ func (d *TelosDaemon) executeFailClosed() {
 
 	flushCount := 0
 	for iterator.Next(&ipKey, &policy) {
+		wasAllowed := policy.Allowed == 1
 		if err := d.maps.NetworkMap.Delete(&ipKey); err == nil {
 			flushCount++
-			metricActiveDrawbridges.Dec()
+			if wasAllowed {
+				metricActiveDrawbridges.Dec()
+			}
 		}
 	}
 	if err := iterator.Err(); err != nil {
