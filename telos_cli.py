@@ -311,7 +311,7 @@ def cmd_start(extra_args: list[str]):
             socket_display = extra_args[i + 1]
             break
     summary.add_row("┃", "IPC", socket_display)
-    summary.add_row("┃", "Dashboard", "http://127.0.0.1:8088")
+    summary.add_row("┃", "Dashboard", "run: ./telos dash")
     summary.add_row("┃", "Daemon Log", str(DAEMON_LOG))
     summary.add_row("┃", "Cortex Log", str(CORTEX_LOG))
 
@@ -439,28 +439,18 @@ def cmd_status():
         )
 
     # Dashboard
-    dash_running = False
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(("127.0.0.1", 8088))
-        s.close()
-        dash_running = True
-    except Exception:
-        pass
-
+    dash_running = pid_alive(Path("/tmp/telos_tui.pid"))
     if dash_running:
         table.add_row(
-            "Web Dashboard",
+            "Terminal UI",
             Text("● RUNNING", style=Style(color=GREEN, bold=True)),
-            "http://127.0.0.1:8088"
+            f"PID: {dash_running}"
         )
     else:
         table.add_row(
-            "Web Dashboard",
+            "Terminal UI",
             Text("● STOPPED", style=Style(color=RED, bold=True)),
-            "run: python3 web_dashboard.py"
+            "run: ./telos dash"
         )
 
     console.print(table)
@@ -527,7 +517,7 @@ def cmd_help():
     console.print(f"  [{DIM}]$[/] [white]sudo ./telos start[/]              [{DIM}]# Start with defaults[/]")
     console.print(f"  [{DIM}]$[/] [white]sudo ./telos start --port 50055[/] [{DIM}]# Custom gRPC port[/]")
     console.print(f"  [{DIM}]$[/] [white]sudo ./telos status[/]             [{DIM}]# Check what's running[/]")
-    console.print(f"  [{DIM}]$[/] [white]python3 web_dashboard.py[/]        [{DIM}]# Launch web UI[/]")
+    console.print(f"  [{DIM}]$[/] [white]./telos dash[/]                   [{DIM}]# Launch Terminal UI[/]")
     console.print()
 
 
@@ -535,16 +525,23 @@ def cmd_help():
 
 def cmd_dash():
     """Launch the TUI telemetry dashboard."""
-    tui_path = PROJECT_DIR / "cortex" / "telemetry_ui.py"
-    fallback = PROJECT_DIR / "telemetry_ui.py"
+    tui_dir = PROJECT_DIR / "telos_tui"
+    tui_bin = tui_dir / "bin" / "telos_tui"
 
-    if tui_path.exists():
-        os.execvp("python3", ["python3", str(tui_path)])
-    elif fallback.exists():
-        os.execvp("python3", ["python3", str(fallback)])
-    else:
-        console.print(f"  [{RED}]✕[/]  telemetry_ui.py not found")
-        sys.exit(1)
+    # Build if it doesn't exist
+    if not tui_bin.exists():
+        console.print(f"  [{YELLOW}]●[/]  [white]Building Go TUI...[/]")
+        success = run_step("go build -o bin/telos_tui", cwd=str(tui_dir))
+        if not success:
+            console.print(f"  [{RED}]✕[/]  Failed to build TUI")
+            sys.exit(1)
+
+    # Write PID so status can find it, though it's foreground
+    Path("/tmp/telos_tui.pid").write_text(str(os.getpid()))
+    try:
+        os.execv(str(tui_bin), [str(tui_bin)])
+    finally:
+        Path("/tmp/telos_tui.pid").unlink(missing_ok=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
