@@ -38,6 +38,9 @@ jobs:
           cache-dependency-path: |
             go.work.sum
             telos_core/loader/go.sum
+            telos_edge/loader/go.sum
+            shared/go.sum
+            telos_tui/go.sum
 
       - name: Install lint dependencies
         run: |
@@ -70,6 +73,9 @@ jobs:
           cache-dependency-path: |
             go.work.sum
             telos_core/loader/go.sum
+            telos_edge/loader/go.sum
+            shared/go.sum
+            telos_tui/go.sum
 
       - name: Install test dependencies
         run: |

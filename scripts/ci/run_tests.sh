@@ -14,9 +14,34 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+GO_BIN="${GO_BIN:-go}"
+if ! command -v "$GO_BIN" >/dev/null 2>&1; then
+  echo "[test] Missing Go executable (go)."
+  exit 1
+fi
+
 echo "[test] Running Go module tests..."
-(cd telos_core/loader && go test ./...)
-(cd telos_edge/loader && go test ./...)
+go_workspace_modules="$(
+  "$GO_BIN" work edit -json 2>/dev/null \
+    | "$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); [print(use.get("DiskPath","")) for use in data.get("Use", [])]' \
+    | sed '/^$/d' \
+    | sort -u
+)"
+if [ -z "$go_workspace_modules" ]; then
+  echo "[test] No Go workspace modules found in go.work."
+  exit 1
+fi
+while IFS= read -r module_dir; do
+  [ -n "$module_dir" ] || continue
+  if [ ! -d "$module_dir" ]; then
+    echo "[test] Skipping missing module directory: $module_dir"
+    continue
+  fi
+  echo "[test] go test ./... ($module_dir)"
+  (cd "$module_dir" && "$GO_BIN" test ./...)
+done <<EOF_GO_MODULES
+$go_workspace_modules
+EOF_GO_MODULES
 
 echo "[test] Running Python unit tests..."
 "$PYTHON_BIN" -m unittest discover -s cortex -p 'test_*.py'
