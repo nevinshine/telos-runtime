@@ -37,6 +37,7 @@ def mock_bpf():
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(EVENTS_SOCKET)
+        os.chmod(EVENTS_SOCKET, 0o777)
     except PermissionError:
         print("[!] Permission denied binding to /var/run/. Please run with sudo.")
         return
