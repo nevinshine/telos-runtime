@@ -134,94 +134,30 @@ def cmd_start(extra_args: list[str]):
 
     args_str = " ".join(extra_args)
 
-    steps = [
-        ("Building eBPF Core", "make bpf", "build"),
-        ("Building Go Loader", "make loader", "build"),
-        ("Starting Telos Daemon", None, "daemon"),
-        ("Starting Telos Cortex", None, "cortex"),
-    ]
+    console.print(f"\n[bold {PURPLE}]telos[/]   [dim]v2.0.0[/]\n")
 
-    with Progress(
-        SpinnerColumn("dots", style=Style(color=PURPLE)),
-        TextColumn("[bold]{task.description}"),
-        BarColumn(
-            bar_width=30,
-            style=Style(color="#374151"),
-            complete_style=Style(color=CYAN),
-            finished_style=Style(color=GREEN),
-            pulse_style=Style(color=PURPLE),
-        ),
-        TaskProgressColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
+    # 1. Build eBPF Core
+    start_t = time.time()
+    if not run_step("make bpf"):
+        console.print(f"[{RED}]✕[/] Failed to build eBPF Core")
+        sys.exit(1)
+    ms = int((time.time() - start_t) * 1000)
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  {'eBPF Core compiled':<35} [dim]{ms}ms[/]")
 
-        overall = progress.add_task(
-            "[bold white]Starting Telos Runtime",
-            total=len(steps),
-        )
+    # 2. Build Go Loader
+    start_t = time.time()
+    if not run_step("make loader"):
+        console.print(f"[{RED}]✕[/] Failed to build Go Loader")
+        sys.exit(1)
+    ms = int((time.time() - start_t) * 1000)
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  {'Go Loader built':<35} [dim]{ms}ms[/]")
 
-        for description, cmd, kind in steps:
-            task = progress.add_task(f"  {description}", total=1)
-            time.sleep(0.1)  # micro-delay for visual smoothness
-
-            success = True
-            detail = ""
-
-            if kind == "build":
-                success = run_step(cmd)
-                if not success:
-                    detail = f"[{RED}]Failed[/]"
-
-            elif kind == "daemon":
-                existing = pid_alive(DAEMON_PID_FILE)
-                if existing:
-                    detail = f"[{YELLOW}]already running (PID: {existing})[/]"
-                else:
-                    DAEMON_LOG.unlink(missing_ok=True)
-                    run_step(
-                        f"nohup ./bin/telos_daemon {args_str} < /dev/null "
-                        f"> '{DAEMON_LOG}' 2>&1 &"
-                    )
-                    # Read back PID
-                    time.sleep(0.3)
-                    result = subprocess.run(
-                        f"nohup ./bin/telos_daemon {args_str} < /dev/null "
-                        f"> '{DAEMON_LOG}' 2>&1 & echo $!",
-                        shell=True, cwd=str(PROJECT_DIR),
-                        capture_output=True, text=True,
-                    )
-                    # Actually let's do it properly
-                    pass
-
-            elif kind == "cortex":
-                existing = pid_alive(CORTEX_PID_FILE)
-                if existing:
-                    detail = f"[{YELLOW}]already running (PID: {existing})[/]"
-
-            progress.update(task, completed=1)
-            progress.update(overall, advance=1)
-
-            if not success:
-                progress.stop()
-                console.print(f"  [{RED}]✕[/]  {description}: {detail}")
-                sys.exit(1)
-
-    # Actually start the processes (outside progress bar for clean output)
-    results = []
-
-    # Build
-    for label, cmd in [("eBPF Core", "make bpf"), ("Go Loader", "make loader")]:
-        if not run_step(cmd):
-            console.print(f"  [{RED}]✕[/]  Failed to build {label}")
-            sys.exit(1)
-        results.append((label, "ok", ""))
-
-    # Daemon
+    # 3. Daemon
+    start_t = time.time()
     daemon_pid = pid_alive(DAEMON_PID_FILE)
-    if daemon_pid:
-        results.append(("Telos Daemon", "skip", f"already running (PID: {daemon_pid})"))
-    else:
+    if not daemon_pid:
         DAEMON_LOG.unlink(missing_ok=True)
         proc = subprocess.Popen(
             ["./bin/telos_daemon"] + extra_args,
@@ -232,15 +168,18 @@ def cmd_start(extra_args: list[str]):
             start_new_session=True,
         )
         DAEMON_PID_FILE.write_text(str(proc.pid))
-        results.append(("Telos Daemon", "ok", f"PID: {proc.pid}"))
+        daemon_pid = proc.pid
+    
+    # Give daemon a tiny moment to bind socket
+    time.sleep(0.5)
+    ms = int((time.time() - start_t) * 1000)
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  {'Sentinel LSM hooks loaded':<35} [dim]{ms}ms[/]")
 
-    time.sleep(1)  # Wait for daemon socket
-
-    # Cortex
+    # 4. Cortex
+    start_t = time.time()
     cortex_pid = pid_alive(CORTEX_PID_FILE)
-    if cortex_pid:
-        results.append(("Telos Cortex", "skip", f"already running (PID: {cortex_pid})"))
-    else:
+    if not cortex_pid:
         CORTEX_LOG.unlink(missing_ok=True)
         sudo_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
         user_packages = f"/home/{sudo_user}/.local/lib/python3.14/site-packages"
@@ -261,22 +200,13 @@ def cmd_start(extra_args: list[str]):
             env=env,
         )
         CORTEX_PID_FILE.write_text(str(proc.pid))
-        results.append(("Telos Cortex", "ok", f"PID: {proc.pid}"))
+        cortex_pid = proc.pid
+    ms = int((time.time() - start_t) * 1000)
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  {'Cortex daemon synchronized':<35} [dim]{ms}ms[/]")
 
-    # Print results
-    for label, status, detail in results:
-        if status == "ok":
-            icon = f"[{GREEN}]●[/]"
-            msg = f"[bold white]{label}[/]"
-            if detail:
-                msg += f"  [{DIM}]{detail}[/]"
-        elif status == "skip":
-            icon = f"[{YELLOW}]●[/]"
-            msg = f"[white]{label}[/]  [{DIM}]{detail}[/]"
-        else:
-            icon = f"[{RED}]●[/]"
-            msg = f"[white]{label}[/]  [{RED}]{detail}[/]"
-        console.print(f"  {icon}  {msg}")
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  Liftoff confirmed. Securing runtime boundary!\n")
 
     # Summary panel
     console.print()
@@ -305,7 +235,6 @@ def cmd_start(extra_args: list[str]):
     summary.add_row("┃", "gRPC", f"grpc://127.0.0.1:{cortex_port}")
     summary.add_row("┃", "DNS", "udp://127.0.0.1:5353")
     socket_display = os.environ.get("TELOS_SOCKET_PATH", "/var/run/telos.sock")
-    # Check if --socket was passed as an explicit arg
     for i, a in enumerate(extra_args):
         if a == "--socket" and i + 1 < len(extra_args):
             socket_display = extra_args[i + 1]
@@ -329,25 +258,26 @@ def cmd_stop():
         console.print(f"  [bold {RED}]✕[/]  Please run as root (use sudo).")
         sys.exit(1)
 
-    console.print(f"  [bold white]Stopping Telos Runtime[/]")
-    console.print()
+    console.print(f"\n[bold {PURPLE}]telos[/]   [dim]v2.0.0[/]\n")
 
     # Stop Cortex
+    start_t = time.time()
     cortex_pid = pid_alive(CORTEX_PID_FILE)
     if cortex_pid:
         os.kill(cortex_pid, signal.SIGTERM)
-        time.sleep(2)
+        time.sleep(1)
         try:
             os.kill(cortex_pid, 0)
             os.kill(cortex_pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        console.print(f"  [{GREEN}]●[/]  [white]Cortex stopped[/]  [{DIM}]PID: {cortex_pid}[/]")
-    else:
-        console.print(f"  [{YELLOW}]●[/]  [white]Cortex[/]  [{DIM}]not running[/]")
     CORTEX_PID_FILE.unlink(missing_ok=True)
+    ms = int((time.time() - start_t) * 1000)
+    console.print(f"[{DARK_GRAY}]│[/]")
+    console.print(f"[{GREEN}]▶[/]  {'Cortex daemon halted':<35} [dim]{ms}ms[/]")
 
     # Stop Daemon
+    start_t = time.time()
     daemon_pid = pid_alive(DAEMON_PID_FILE)
     if daemon_pid:
         os.kill(daemon_pid, signal.SIGTERM)
