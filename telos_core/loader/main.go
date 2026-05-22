@@ -175,6 +175,10 @@ type TelosDaemon struct {
 	alertFile *os.File
 	alertMu   sync.Mutex
 
+	// [Phase 6: Heki EPT Preparation]
+	batcher    *MapBatcher
+	hekiBridge *HekiBridge
+
 	listener       net.Listener
 	eventsListener net.Listener
 	eventClients   map[net.Conn]struct{}
@@ -265,6 +269,8 @@ func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
 		failPolicy:       failPolicy,
 		watchdogActive:   false, // Initially inactive
 		lastPingTime:     time.Now(),
+		batcher:          NewMapBatcher(),
+		hekiBridge:       NewHekiBridge(),
 	}
 }
 
@@ -821,6 +827,12 @@ func (d *TelosDaemon) handleCommand(cmd IPCCommand) IPCResponse {
 	case "BULK_BLOCK_IPS": // [Phase 4: Threat Intel Feed]
 		return d.cmdBulkBlockIPs(cmd.Data)
 
+	case "LOAD_SANDBOX": // [Phase 6: ELF Sandbox Loader]
+		return d.cmdLoadSandbox(cmd.Data)
+
+	case "HEKI_STATUS": // [Phase 6: Heki Bridge Status]
+		return d.cmdHekiStatus()
+
 	default:
 		return IPCResponse{
 			Success: false,
@@ -1130,6 +1142,11 @@ func (d *TelosDaemon) sendResponse(conn net.Conn, resp IPCResponse) {
 // Stop gracefully shuts down the daemon
 func (d *TelosDaemon) Stop() {
 	log.Println("Shutting down Telos Core...")
+
+	// [Phase 6] Flush and stop the batcher
+	if d.batcher != nil {
+		d.batcher.Stop()
+	}
 
 	close(d.done)
 

@@ -593,6 +593,61 @@ def test_extreme_speed():
          r.get("success") is True, f"{ms:.1f}ms")
 
 # ══════════════════════════════════════════════════════════════
+# 11. PHASE 6: HEKI PREPARATION
+# ══════════════════════════════════════════════════════════════
+
+def test_phase6_heki():
+    section("11. Phase 6: Heki EPT Preparation")
+
+    # HEKI_STATUS — should work even without VMI connected
+    r = ipc("HEKI_STATUS")
+    test("HEKI_STATUS returns success", r.get("success") is True)
+    status = r.get("data", {})
+    test("Heki status has 'enabled' field", "enabled" in status,
+         f"enabled={status.get('enabled')}")
+    test("Heki status has 'connected' field", "connected" in status)
+
+    # LOAD_SANDBOX — with the telosc-compiled ELF if available
+    sandbox_path = str(PROJECT_DIR.parent / "telos-lang" / "telosc" / "bpf_sandbox.o")
+    if os.path.exists(sandbox_path):
+        r, ms = timed(lambda: ipc("LOAD_SANDBOX",
+                                   {"elf_path": sandbox_path}))
+        test("LOAD_SANDBOX parses telosc ELF", r.get("success") is True,
+             f"{ms:.1f}ms")
+        if r.get("success"):
+            data = r.get("data", {})
+            test("ELF has LSM hooks",
+                 len(data.get("lsm_hooks", [])) > 0,
+                 f"{data.get('lsm_hooks')}")
+            test("ELF has maps",
+                 data.get("map_count", 0) > 0,
+                 f"{data.get('map_count')} maps")
+            test("Status is parsed_and_verified",
+                 data.get("status") == "parsed_and_verified")
+    else:
+        skip("LOAD_SANDBOX (telosc ELF)", f"{sandbox_path} not found")
+
+    # LOAD_SANDBOX — invalid path
+    r = ipc("LOAD_SANDBOX", {"elf_path": "/nonexistent/fake.o"})
+    test("LOAD_SANDBOX rejects missing file", r.get("success") is False)
+
+    # LOAD_SANDBOX — missing field
+    r = ipc("LOAD_SANDBOX", {})
+    test("LOAD_SANDBOX rejects empty data", r.get("success") is False)
+
+    # Batcher metrics exist in Prometheus
+    try:
+        resp = urllib.request.urlopen(METRICS_URL, timeout=5)
+        body = resp.read().decode()
+        test("Metric 'telos_batch_flush_ops_total' exposed",
+             "telos_batch_flush_ops_total" in body)
+        test("Metric 'telos_batch_queue_depth' exposed",
+             "telos_batch_queue_depth" in body)
+    except Exception:
+        skip("Batcher Prometheus metrics", "metrics endpoint unreachable")
+
+
+# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -622,11 +677,12 @@ def main():
     test_latency()
     test_fork_resilience()
     test_extreme_speed()
+    test_phase6_heki()
 
     elapsed = time.perf_counter() - t_start
 
     # ── Kernel Event Audit ──────────────────────────────────────
-    section("11. Kernel Event Audit (Live Blocks)")
+    section("12. Kernel Event Audit (Live Blocks)")
 
     log_path = Path(ALERT_LOG)
     if log_path.exists():
