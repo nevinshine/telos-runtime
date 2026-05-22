@@ -53,6 +53,7 @@ GREEN = "#86efac"
 RED = "#f87171"
 YELLOW = "#fde047"
 DIM = "#6b7280"
+DARK_GRAY = "#333333"
 WHITE = "#f9fafb"
 SURFACE = "#1e1e2e"
 
