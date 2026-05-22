@@ -94,7 +94,7 @@ bpf: $(BIN_DIR) vmlinux
 loader: $(BIN_DIR)
 	@echo "Building Go loader..."
 	cd telos_core/loader && $(GO) mod tidy
-	cd telos_core/loader && $(GO) build -o ../../$(LOADER_BIN) main.go
+	cd telos_core/loader && $(GO) build -o ../../$(LOADER_BIN) .
 	@echo "✓ Built $(LOADER_BIN)"
 
 # === PROTOBUF TARGET ===
