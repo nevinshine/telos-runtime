@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbletea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -19,50 +20,46 @@ const (
 	CortexLog    = "/tmp/telos_cortex.log"
 )
 
-// --- Styling (The Midnight & Neon Astro Theme) ---
+// --- COLORS (Cyber-Grid Theme) ---
 var (
-	colorBlack     = lipgloss.Color("#000000")
-	colorSlate     = lipgloss.Color("#1E293B")
-	colorSlateDim  = lipgloss.Color("#0F172A")
-	colorCyan      = lipgloss.Color("#06B6D4")
-	colorViolet    = lipgloss.Color("#8B5CF6")
-	colorEmerald   = lipgloss.Color("#10B981")
-	colorAmber     = lipgloss.Color("#F59E0B")
-	colorRose      = lipgloss.Color("#F43F5E")
-	colorWhiteDim  = lipgloss.Color("#9CA3AF")
-	colorWhiteHigh = lipgloss.Color("#F8FAFC")
+	cBrand   = lipgloss.Color("#FF00FF") // Neon Magenta
+	cCyan    = lipgloss.Color("#00E5FF") // Electric Cyan
+	cGreen   = lipgloss.Color("#00FF66") // Matrix Green
+	cRed     = lipgloss.Color("#FF0033") // Danger Red
+	cDark    = lipgloss.Color("#333333") // Dark Grey borders
+	cText    = lipgloss.Color("#FFFFFF") // Pure White text
+	cSubtext = lipgloss.Color("#888888") // Dim text
+)
 
-	styleBase = lipgloss.NewStyle().
-			Foreground(colorWhiteHigh).
-			Background(colorBlack)
+// --- STYLES ---
+var (
+	baseStyle = lipgloss.NewStyle().Padding(1, 2).Foreground(cText).Background(lipgloss.Color("#000000"))
 
-	styleHeader = lipgloss.NewStyle().
-			Foreground(colorCyan).
-			Bold(true)
+	// Header
+	headerStyle = lipgloss.NewStyle().Foreground(cBrand).Bold(true)
+	lineStyle   = lipgloss.NewStyle().Foreground(cDark)
+	activeStyle = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 
-	styleRowClean = lipgloss.NewStyle().
-			Foreground(colorWhiteDim)
-
-	styleRowTainted = lipgloss.NewStyle().
-			Foreground(colorAmber)
-
-	styleBadgeAllow = lipgloss.NewStyle().
-			Foreground(colorBlack).
-			Background(colorEmerald).
+	// Cards
+	cardBorder = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(cDark).
 			Padding(0, 1).
-			Bold(true)
+			Width(25)
 
-	styleBadgeBlock = lipgloss.NewStyle().
-			Foreground(colorBlack).
-			Background(colorRose).
-			Padding(0, 1).
-			Bold(true)
+	cardTitle = lipgloss.NewStyle().Foreground(cCyan).Bold(true)
 
-	styleBadgeMonitor = lipgloss.NewStyle().
-				Foreground(colorBlack).
-				Background(colorAmber).
-				Padding(0, 1).
-				Bold(true)
+	// Arena
+	arenaTitle = lipgloss.NewStyle().Foreground(cBrand).Bold(true).MarginTop(1)
+	arenaLine  = lipgloss.NewStyle().Foreground(cDark)
+
+	// Statuses
+	safeText  = lipgloss.NewStyle().Foreground(cGreen)
+	alertText = lipgloss.NewStyle().Foreground(cRed)
+	dimText   = lipgloss.NewStyle().Foreground(cSubtext)
+
+	// Ticker
+	tickerPrefix = lipgloss.NewStyle().Foreground(cBrand).Bold(true).MarginTop(1)
 )
 
 // --- Types ---
@@ -74,15 +71,15 @@ type bpfEvent struct {
 }
 
 type model struct {
-	width          int
-	height         int
-	events         []string
-	cpu            float64
-	mem            int
-	xdpDrops       int
-	lsmHooks       int
-	bpfEventChan   chan string
-	cortexLogChan  chan string
+	width         int
+	height        int
+	events        []string
+	cpu           float64
+	mem           int
+	xdpDrops      int
+	lsmHooks      int
+	bpfEventChan  chan string
+	cortexLogChan chan string
 }
 
 // Custom msg types for tea.Cmd
@@ -93,10 +90,10 @@ type tickMsg time.Time
 func main() {
 	m := model{
 		events:        make([]string, 0, 100),
-		cpu:           0.2,
-		mem:           14,
-		xdpDrops:      12,
-		lsmHooks:      44,
+		cpu:           42.0,
+		mem:           74,
+		xdpDrops:      14,
+		lsmHooks:      402,
 		bpfEventChan:  make(chan string, 100),
 		cortexLogChan: make(chan string, 100),
 	}
@@ -107,22 +104,21 @@ func main() {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
+		log.Fatal(err)
 		os.Exit(1)
 	}
 }
 
 // --- Background Workers ---
 func tailCortexLog(out chan string) {
-	// Simple tail implementation
 	file, err := os.Open(CortexLog)
 	if err != nil {
-		out <- fmt.Sprintf("Error opening cortex log: %v", err)
+		out <- fmt.Sprintf("Error: %v", err)
 		return
 	}
 	defer file.Close()
 
-	file.Seek(0, 2) // Seek to end
+	file.Seek(0, 2)
 	reader := bufio.NewReader(file)
 
 	for {
@@ -131,17 +127,17 @@ func tailCortexLog(out chan string) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		
+
 		line = strings.TrimSpace(line)
 		if strings.Contains(line, "[Intent]") {
 			parts := strings.SplitN(line, "[Intent]", 2)
 			if len(parts) == 2 {
-				out <- lipgloss.NewStyle().Foreground(colorCyan).Render(fmt.Sprintf("[ALLOW]  intent_decl      cortex (%s)", strings.TrimSpace(parts[1])))
+				out <- safeText.Render(fmt.Sprintf("intent_decl cortex (%s)", strings.TrimSpace(parts[1])))
 			}
 		} else if strings.Contains(line, "✅ Intent APPROVED") {
-			out <- lipgloss.NewStyle().Foreground(colorEmerald).Render("[ALLOW]  network_gate     OPEN")
+			out <- safeText.Render("network_gate OPEN")
 		} else if strings.Contains(line, "❌ Intent DENIED") {
-			out <- lipgloss.NewStyle().Foreground(colorRose).Render("[BLOCK]  intent_denied    " + line)
+			out <- alertText.Render("intent_denied ⛔")
 		}
 	}
 }
@@ -160,14 +156,14 @@ func streamBPFEvents(out chan string) {
 			if err := json.Unmarshal(scanner.Bytes(), &event); err == nil {
 				action := event.Action
 				var styledAction string
-				if action == "exec_denied" {
-					styledAction = styleBadgeBlock.Render("BLOCK") + "  exec             " + fmt.Sprintf("PID %d", event.PID)
+				if action == "exec_denied" || action == "exfil_blocked" {
+					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d ⛔", action, event.PID))
 				} else if action == "taint_elevate" {
-					styledAction = styleBadgeMonitor.Render("TAINT") + "  lsm_hook         " + fmt.Sprintf("PID %d", event.PID)
+					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d ⚠️", action, event.PID))
 				} else {
-					styledAction = lipgloss.NewStyle().Foreground(colorWhiteDim).Render(fmt.Sprintf("[INFO]   %-16s PID %d", action, event.PID))
+					styledAction = dimText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
 				}
-				out <- fmt.Sprintf("%s  %s", time.Now().Format("15:04:05"), styledAction)
+				out <- styledAction
 			}
 		}
 		conn.Close()
@@ -230,46 +226,86 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	if m.width == 0 {
-		return "Initializing..."
+		return ""
 	}
 
-	header := styleHeader.Render(fmt.Sprintf("▲ TELOS v2.0   ● LIVE   %s", time.Now().Format("15:04:05")))
-	separator := lipgloss.NewStyle().Foreground(colorSlate).Render(strings.Repeat("━", m.width))
+	// 1. HEADER
+	header := fmt.Sprintf("%s %s   %s",
+		headerStyle.Render("⣿ TELOS RUNTIME"),
+		dimText.Render("v2.0"),
+		lineStyle.Render(strings.Repeat("─", 45)),
+	)
+	status := activeStyle.Render(fmt.Sprintf("◉ ACTIVE   %s", time.Now().Format("15:04:05")))
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Bottom, header, "  ", status)
 
-	vitals := fmt.Sprintf(`  VITALS 
-  cpu %.1f%%   mem %dMB   [ ▂▃▄▅▇█ ]  XDP drops/s: %d  LSM hooks: %d`, m.cpu, m.mem, m.xdpDrops, m.lsmHooks)
+	// 2. TOP CARDS (Horizontal Flexbox)
+	sysCard := cardBorder.Render(fmt.Sprintf("%s\nCPU  [%s] %.0f%%\nMEM  [%s] %d%%",
+		cardTitle.Render("SYSTEM VITALS"),
+		safeText.Render("████")+dimText.Render("░░░░░░"), m.cpu,
+		alertText.Render("███████")+dimText.Render("░░░"), m.mem,
+	))
 
-	// Column widths
-	colPID := lipgloss.NewStyle().Width(8)
-	colProcess := lipgloss.NewStyle().Width(13)
-	colStatus := lipgloss.NewStyle().Width(13)
-	colNetwork := lipgloss.NewStyle().Width(15)
-	colAction := lipgloss.NewStyle().Width(10)
+	netCard := cardBorder.Render(fmt.Sprintf("%s\nBLOCKED %10s\nALLOWED %10s",
+		cardTitle.Render("NETWORK (XDP)"),
+		alertText.Render(fmt.Sprintf("%d req/s", m.xdpDrops)),
+		safeText.Render("842 req/s"),
+	))
 
-	headerRow := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("PID"), colProcess.Render("PROCESS"), colStatus.Render("STATUS"), colNetwork.Render("NETWORK"), colAction.Render("ACTION"))
-	
-	r1 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("1042"), colProcess.Render("nginx"), colStatus.Render("● Clean"), colNetwork.Render("● Allow"), colAction.Render(styleBadgeAllow.Render("Allow")))
-	r2 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("3391"), colProcess.Render("node"), colStatus.Render("● Clean"), colNetwork.Render("● Allow"), colAction.Render(styleBadgeAllow.Render("Allow")))
-	r3 := ""
-	r4 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("❯ 8991"), colProcess.Render("bash"), colStatus.Render(lipgloss.NewStyle().Foreground(colorAmber).Render("● TAINTED")), colNetwork.Render(lipgloss.NewStyle().Foreground(colorRose).Render("● BLOCK")), colAction.Render(styleBadgeMonitor.Render("Monitor")))
-	r5 := "  ╰─► sys_read (socket -> buffer)"
-	r6 := "  ╰─► bpf_lsm_file_open (signature match)"
+	lsmCard := cardBorder.Render(fmt.Sprintf("%s\nINTERCEPTS %7s\nTAINTED %10s",
+		cardTitle.Render("KERNEL (LSM)"),
+		safeText.Render(fmt.Sprintf("%d ev/s", m.lsmHooks)),
+		alertText.Render("2 ev/s"),
+	))
 
-	tableContent := lipgloss.JoinVertical(lipgloss.Left, headerRow, r1, r2, r3, r4, r5, r6)
-	
-	tableBox := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(colorWhiteDim).
-		Padding(0, 1).
-		Render(tableContent)
+	cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, sysCard, "  ", netCard, "  ", lsmCard)
 
-	table := "  ENFORCEMENT ARENA\n  " + strings.ReplaceAll(tableBox, "\n", "\n  ")
+	// 3. THREAT ARENA (Process Table)
+	arenaHead := fmt.Sprintf(" %s %s", arenaTitle.Render("THREAT ARENA"), arenaLine.Render(strings.Repeat("┈", 65)))
 
-	var streamBuilder strings.Builder
-	streamBuilder.WriteString(fmt.Sprintf("  LIVE EVENT STREAM (TRACING)\n  %s\n", lipgloss.NewStyle().Foreground(colorWhiteDim).Render(strings.Repeat("─", 63))))
-	for _, e := range m.events {
-		streamBuilder.WriteString("  " + e + "\n")
+	table := fmt.Sprintf(`  PID      TARGET         INTEGRITY       STATE                ACTION
+  1042     nginx          %s      %s         [ ALLOW ]
+  3391     node           %s      %s         [ ALLOW ]
+  8991   %s bash           %s       %s      [ BLOCKED ]
+           └─► SECCOMP: sys_socket (TCP OUTBOUND)
+           └─► LSM: bpf_file_open (signature match)`,
+		safeText.Render("✓ Verified"), safeText.Render("🟢 LISTENING"),
+		safeText.Render("✓ Verified"), safeText.Render("🟢 LISTENING"),
+		headerStyle.Render("❯"), alertText.Render("✗ TAINTED "), alertText.Render("🔴 EXFILTRATING"),
+	)
+
+	// 4. LIVE TICKER
+	tickerContent := ""
+	if len(m.events) > 0 {
+		var tickerParts []string
+		start := len(m.events) - 4
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(m.events); i++ {
+			tickerParts = append(tickerParts, m.events[i])
+		}
+		tickerContent = strings.Join(tickerParts, "  |  ")
+	} else {
+		tickerContent = dimText.Render("Waiting for live trace events...")
 	}
 
-	return styleBase.Render(fmt.Sprintf("%s\n%s\n\n%s\n\n%s\n\n%s", header, separator, vitals, table, streamBuilder.String()))
+	ticker := fmt.Sprintf("%s  %s",
+		tickerPrefix.Render("LIVE ❯"),
+		tickerContent,
+	)
+
+	// ASSEMBLE
+	ui := lipgloss.JoinVertical(lipgloss.Left,
+		headerRow,
+		"",
+		cardsRow,
+		"",
+		arenaHead,
+		"",
+		table,
+		"",
+		ticker,
+	)
+
+	return baseStyle.Render(ui) + "\n"
 }
