@@ -144,7 +144,7 @@ func tailCortexLog(out chan string) {
 		} else if strings.Contains(line, "✅ Intent APPROVED") {
 			out <- safeText.Render("network_gate OPEN")
 		} else if strings.Contains(line, "❌ Intent DENIED") {
-			out <- alertText.Render("intent_denied ⛔")
+			out <- alertText.Render("intent_denied")
 		}
 	}
 }
@@ -164,9 +164,9 @@ func streamBPFEvents(out chan string) {
 				action := event.Action
 				var styledAction string
 				if action == "exec_denied" || action == "exfil_blocked" {
-					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d ⛔", action, event.PID))
+					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
 				} else if action == "taint_elevate" {
-					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d ⚠️", action, event.PID))
+					styledAction = alertText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
 				} else {
 					styledAction = dimText.Render(fmt.Sprintf("%s PID:%d", action, event.PID))
 				}
@@ -290,22 +290,22 @@ func (m model) View() string {
 	r1 := lipgloss.JoinHorizontal(lipgloss.Left, 
 		colPID.Render("1042"), 
 		colTarget.Render("nginx"), 
-		colIntegrity.Render(safeText.Render("✓ Verified")), 
-		colState.Render(safeText.Render("🟢 LISTENING")), 
+		colIntegrity.Render(safeText.Render("VERIFIED")), 
+		colState.Render(safeText.Render("LISTENING")), 
 		colAction.Render("[ ALLOW ]"))
 	
 	r2 := lipgloss.JoinHorizontal(lipgloss.Left, 
 		colPID.Render("3391"), 
 		colTarget.Render("node"), 
-		colIntegrity.Render(safeText.Render("✓ Verified")), 
-		colState.Render(safeText.Render("🟢 LISTENING")), 
+		colIntegrity.Render(safeText.Render("VERIFIED")), 
+		colState.Render(safeText.Render("LISTENING")), 
 		colAction.Render("[ ALLOW ]"))
 
 	r3 := lipgloss.JoinHorizontal(lipgloss.Left, 
 		colPID.Render(headerStyle.Render("❯") + " 8991"), 
 		colTarget.Render("bash"), 
-		colIntegrity.Render(alertText.Render("✗ TAINTED")), 
-		colState.Render(alertText.Render("🔴 EXFILTRATING")), 
+		colIntegrity.Render(alertText.Render("TAINTED")), 
+		colState.Render(alertText.Render("EXFILTRATING")), 
 		colAction.Render("[ BLOCKED ]"))
 	
 	r4 := "         └─► SECCOMP: sys_socket (TCP OUTBOUND)"
