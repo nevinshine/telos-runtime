@@ -239,20 +239,34 @@ func (m model) View() string {
 	vitals := fmt.Sprintf(`  VITALS 
   cpu %.1f%%   mem %dMB   [ ▂▃▄▅▇█ ]  XDP drops/s: %d  LSM hooks: %d`, m.cpu, m.mem, m.xdpDrops, m.lsmHooks)
 
-	table := `  ENFORCEMENT ARENA
-  ╭──────────────────────────────────────────────────────────────╮
-  │  PID     PROCESS      STATUS       NETWORK        ACTION     │
-  │  1042    nginx        ● Clean      ● Allow        ` + styleBadgeAllow.Render("Allow") + `      │
-  │  3391    node         ● Clean      ● Allow        ` + styleBadgeAllow.Render("Allow") + `      │
-  │                                                              │
-  │ ❯ 8991   bash         ` + lipgloss.NewStyle().Foreground(colorAmber).Render("● TAINTED") + `    ` + lipgloss.NewStyle().Foreground(colorRose).Render("● BLOCK") + `        ` + styleBadgeMonitor.Render("Monitor") + `    │
-  │   ╰─► sys_read (socket -> buffer)                            │
-  │   ╰─► bpf_lsm_file_open (signature match)                    │
-  │                                                              │
-  ╰──────────────────────────────────────────────────────────────╯`
+	// Column widths
+	colPID := lipgloss.NewStyle().Width(8)
+	colProcess := lipgloss.NewStyle().Width(13)
+	colStatus := lipgloss.NewStyle().Width(13)
+	colNetwork := lipgloss.NewStyle().Width(15)
+	colAction := lipgloss.NewStyle().Width(10)
+
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("PID"), colProcess.Render("PROCESS"), colStatus.Render("STATUS"), colNetwork.Render("NETWORK"), colAction.Render("ACTION"))
+	
+	r1 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("1042"), colProcess.Render("nginx"), colStatus.Render("● Clean"), colNetwork.Render("● Allow"), colAction.Render(styleBadgeAllow.Render("Allow")))
+	r2 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("3391"), colProcess.Render("node"), colStatus.Render("● Clean"), colNetwork.Render("● Allow"), colAction.Render(styleBadgeAllow.Render("Allow")))
+	r3 := ""
+	r4 := lipgloss.JoinHorizontal(lipgloss.Left, colPID.Render("❯ 8991"), colProcess.Render("bash"), colStatus.Render(lipgloss.NewStyle().Foreground(colorAmber).Render("● TAINTED")), colNetwork.Render(lipgloss.NewStyle().Foreground(colorRose).Render("● BLOCK")), colAction.Render(styleBadgeMonitor.Render("Monitor")))
+	r5 := "  ╰─► sys_read (socket -> buffer)"
+	r6 := "  ╰─► bpf_lsm_file_open (signature match)"
+
+	tableContent := lipgloss.JoinVertical(lipgloss.Left, headerRow, r1, r2, r3, r4, r5, r6)
+	
+	tableBox := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(colorWhiteDim).
+		Padding(0, 1).
+		Render(tableContent)
+
+	table := "  ENFORCEMENT ARENA\n  " + strings.ReplaceAll(tableBox, "\n", "\n  ")
 
 	var streamBuilder strings.Builder
-	streamBuilder.WriteString("  LIVE EVENT STREAM (TRACING)\n  ────────────────────────────────────────────────────────\n")
+	streamBuilder.WriteString(fmt.Sprintf("  LIVE EVENT STREAM (TRACING)\n  %s\n", lipgloss.NewStyle().Foreground(colorWhiteDim).Render(strings.Repeat("─", 63))))
 	for _, e := range m.events {
 		streamBuilder.WriteString("  " + e + "\n")
 	}
