@@ -10,6 +10,12 @@ CORTEX_LOG = "/tmp/telos_cortex.log"
 
 def mock_cortex():
     print(f"[*] Starting mock Cortex log writer to {CORTEX_LOG}...")
+    try:
+        if os.path.exists(CORTEX_LOG):
+            os.remove(CORTEX_LOG)
+    except PermissionError:
+        pass
+
     with open(CORTEX_LOG, "a") as f:
         events = [
             "[Intent] declare network policy for node",
