@@ -486,7 +486,7 @@ def main():
     command = sys.argv[1]
     extra = sys.argv[2:]
 
-    if command in ("start", "stop", "status", "help"):
+    if command in ("status", "help"):
         print_header()
 
     if command == "start":
