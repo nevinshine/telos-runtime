@@ -19,6 +19,9 @@ LimitNOFILE=1048576
 MemoryMax=250M
 CPUQuota=20%
 
+# [Phase 3] Auto-create /var/log/telos/ for NDJSON alert logging
+LogsDirectory=telos
+
 # Aggressive restart policy for fail-safe recovery
 Restart=always
 RestartSec=2

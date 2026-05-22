@@ -25,6 +25,8 @@
 #define INODE_MAP_PATH TELOS_BPF_PATH "/inode_map"
 #define NETWORK_MAP_PATH TELOS_BPF_PATH "/network_map"
 #define EXEC_POLICY_MAP_PATH TELOS_BPF_PATH "/exec_policy_map"
+#define TAINTED_MMAP_MAP_PATH TELOS_BPF_PATH "/tainted_mmap_map"
+#define TAINTED_SHMID_MAP_PATH TELOS_BPF_PATH "/tainted_shmid_map"
 
 /*
  * Inode sensitivity levels

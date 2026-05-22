@@ -129,21 +129,27 @@ type BPFEvent struct {
 
 // Maps loaded from the BPF object
 type BPFMaps struct {
-	ProcessMap    *ebpf.Map
-	ConfigMap     *ebpf.Map
-	InodeMap      *ebpf.Map
-	NetworkMap    *ebpf.Map
-	ExecPolicyMap *ebpf.Map // [Phase 5]
-	MirageMap     *ebpf.Map // [Phase 4]
-	HoneyDataMap  *ebpf.Map // [Phase 4]
-	Events        *ebpf.Map
+	ProcessMap      *ebpf.Map
+	ConfigMap       *ebpf.Map
+	InodeMap        *ebpf.Map
+	NetworkMap      *ebpf.Map
+	ExecPolicyMap   *ebpf.Map // [Phase 5]
+	MirageMap       *ebpf.Map // [Phase 4]
+	HoneyDataMap    *ebpf.Map // [Phase 4]
+	TaintedMmapMap  *ebpf.Map // [Phase 2] IPC taint tracking
+	TaintedShmidMap *ebpf.Map // [Phase 2] IPC taint tracking
+	Events          *ebpf.Map
 }
 
 // Links to LSM hooks and kprobes
 type BPFLinks struct {
 	CheckExec          link.Link
 	CheckFile          link.Link
+	CheckConnect       link.Link
 	TaskAlloc          link.Link
+	CheckMmap          link.Link // [Phase 2]
+	CheckPtrace        link.Link // [Phase 2]
+	CheckShmat         link.Link // [Phase 2]
 	MirageReadEnter    link.Link
 	MirageReadExit     link.Link
 	MirageGetattrEnter link.Link
@@ -164,6 +170,10 @@ type TelosDaemon struct {
 	pingMutex      sync.Mutex
 	failPolicy     string // "OPEN" or "CLOSED"
 	watchdogActive bool   // True if Cortex has connected at least once
+
+	// [Phase 3: NDJSON Alert Logger]
+	alertFile *os.File
+	alertMu   sync.Mutex
 
 	listener       net.Listener
 	eventsListener net.Listener
@@ -198,6 +208,35 @@ var (
 			Help: "Current number of actively allowed IP domains in the network_map",
 		},
 	)
+
+	// [Phase 3] Enhanced Telemetry Metrics
+	metricProcessMapSize = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "telos_process_map_size",
+			Help: "Current number of tracked processes in the BPF LRU map",
+		},
+	)
+	metricMirageFeeds = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "telos_mirage_feeds_total",
+			Help: "Total number of Mirage deception payloads served to tainted agents",
+		},
+	)
+	metricXdpDrops = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "telos_xdp_drops_total",
+			Help: "Total number of XDP packet drops (placeholder for XDP event aggregation)",
+		},
+	)
+
+	// [Phase 4] Fleet Governance Metrics
+	metricMapUtilization = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "telos_bpf_map_utilization",
+			Help: "Current number of entries in each tracked BPF map",
+		},
+		[]string{"map"},
+	)
 )
 
 func init() {
@@ -205,6 +244,10 @@ func init() {
 	prometheus.MustRegister(metricNetworkBlocks)
 	prometheus.MustRegister(metricIfcElevations)
 	prometheus.MustRegister(metricActiveDrawbridges)
+	prometheus.MustRegister(metricProcessMapSize)
+	prometheus.MustRegister(metricMirageFeeds)
+	prometheus.MustRegister(metricXdpDrops)
+	prometheus.MustRegister(metricMapUtilization)
 }
 
 func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
@@ -292,6 +335,13 @@ func (d *TelosDaemon) Start() error {
 	go d.readEvents()
 	go d.orphanCleanupRoutine()
 
+	// [Phase 3] Initialize NDJSON alert logger
+	if err := d.initAlertLogger(); err != nil {
+		log.Printf("Warning: NDJSON alert logger disabled: %v", err)
+	} else {
+		log.Println("✓ NDJSON alert logger active → /var/log/telos/alerts.json")
+	}
+
 	fmt.Println()
 	fmt.Println(Green + "  ╔═══════════════════════════════════════════════════════╗" + Reset)
 	fmt.Println(Green + "  ║" + Bold + "        TELOS CORE ONLINE - Enforcing Security         " + Reset + Green + "║" + Reset)
@@ -317,14 +367,16 @@ func (d *TelosDaemon) loadBPF() error {
 
 	// Store map references
 	d.maps = &BPFMaps{
-		ProcessMap:    coll.Maps["process_map"],
-		ConfigMap:     coll.Maps["config_map"],
-		InodeMap:      coll.Maps["inode_map"],
-		NetworkMap:    coll.Maps["network_map"],
-		ExecPolicyMap: coll.Maps["exec_policy_map"], // [Phase 5]
-		MirageMap:     coll.Maps["mirage_map"],      // [Phase 4]
-		HoneyDataMap:  coll.Maps["honey_data_map"],  // [Phase 4]
-		Events:        coll.Maps["events"],
+		ProcessMap:      coll.Maps["process_map"],
+		ConfigMap:       coll.Maps["config_map"],
+		InodeMap:        coll.Maps["inode_map"],
+		NetworkMap:      coll.Maps["network_map"],
+		ExecPolicyMap:   coll.Maps["exec_policy_map"],   // [Phase 5]
+		MirageMap:       coll.Maps["mirage_map"],         // [Phase 4]
+		HoneyDataMap:    coll.Maps["honey_data_map"],     // [Phase 4]
+		TaintedMmapMap:  coll.Maps["tainted_mmap_map"],   // [Phase 2]
+		TaintedShmidMap: coll.Maps["tainted_shmid_map"],  // [Phase 2]
+		Events:          coll.Maps["events"],
 	}
 
 	// Pin maps for external access
@@ -410,14 +462,56 @@ func (d *TelosDaemon) loadBPF() error {
 	// Attach socket_connect
 	prog = coll.Programs["telos_check_connect"]
 	if prog != nil {
-		_, err := link.AttachLSM(link.LSMOptions{
+		l, err := link.AttachLSM(link.LSMOptions{
 			Program: prog,
 		})
 		if err != nil {
 			log.Printf("Warning: Failed to attach check_connect: %v", err)
 		} else {
-			// Save reference if struct updated (currently no check_connect field in BPFLinks)
+			d.links.CheckConnect = l
 			log.Println("  → Attached lsm/socket_connect")
+		}
+	}
+
+	// [Phase 2] Attach mmap_file (IPC taint propagation)
+	prog = coll.Programs["telos_check_mmap"]
+	if prog != nil {
+		l, err := link.AttachLSM(link.LSMOptions{
+			Program: prog,
+		})
+		if err != nil {
+			log.Printf("Warning: Failed to attach check_mmap: %v", err)
+		} else {
+			d.links.CheckMmap = l
+			log.Println("  → Attached lsm/mmap_file")
+		}
+	}
+
+	// [Phase 2] Attach ptrace_access_check (IFC boundary enforcement)
+	prog = coll.Programs["telos_check_ptrace"]
+	if prog != nil {
+		l, err := link.AttachLSM(link.LSMOptions{
+			Program: prog,
+		})
+		if err != nil {
+			log.Printf("Warning: Failed to attach check_ptrace: %v", err)
+		} else {
+			d.links.CheckPtrace = l
+			log.Println("  → Attached lsm/ptrace_access_check")
+		}
+	}
+
+	// [Phase 2] Attach shm_shmat (SysV shared memory taint tracking)
+	prog = coll.Programs["telos_check_shmat"]
+	if prog != nil {
+		l, err := link.AttachLSM(link.LSMOptions{
+			Program: prog,
+		})
+		if err != nil {
+			log.Printf("Warning: Failed to attach check_shmat: %v", err)
+		} else {
+			d.links.CheckShmat = l
+			log.Println("  → Attached lsm/shm_shmat")
 		}
 	}
 
@@ -621,11 +715,19 @@ func (d *TelosDaemon) readEvents() {
 				metricExecBlocks.Inc()
 			} else if event.DescStr == "exfil_blocked" || event.DescStr == "connect_denied" || event.DescStr == "connect_ipv6_denied" {
 				metricNetworkBlocks.Inc()
+			} else if event.DescStr == "ptrace_denied" {
+				metricNetworkBlocks.Inc() // ptrace blocks are security enforcement
 			}
 		}
-		if event.DescStr == "taint_elevate" {
+		if event.DescStr == "taint_elevate" || event.DescStr == "mmap_taint_inh" || event.DescStr == "shmat_taint_inh" {
 			metricIfcElevations.Inc()
 		}
+		if event.DescStr == "mirage_fed" {
+			metricMirageFeeds.Inc()
+		}
+
+		// [Phase 3] Write to NDJSON alert log
+		d.writeAlertNDJSON(event)
 
 		d.broadcastEvent(event)
 	}
@@ -715,6 +817,9 @@ func (d *TelosDaemon) handleCommand(cmd IPCCommand) IPCResponse {
 
 	case "ADD_MIRAGE":
 		return d.cmdAddMirage(cmd.Data)
+
+	case "BULK_BLOCK_IPS": // [Phase 4: Threat Intel Feed]
+		return d.cmdBulkBlockIPs(cmd.Data)
 
 	default:
 		return IPCResponse{
@@ -1022,6 +1127,11 @@ func (d *TelosDaemon) Stop() {
 		d.listener.Close()
 	}
 
+	// [Phase 3] Close NDJSON alert log
+	if d.alertFile != nil {
+		d.alertFile.Close()
+	}
+
 	// Detach LSM hooks and kprobes
 	if d.links != nil {
 		if d.links.CheckExec != nil {
@@ -1030,8 +1140,21 @@ func (d *TelosDaemon) Stop() {
 		if d.links.CheckFile != nil {
 			d.links.CheckFile.Close()
 		}
+		if d.links.CheckConnect != nil {
+			d.links.CheckConnect.Close()
+		}
 		if d.links.TaskAlloc != nil {
 			d.links.TaskAlloc.Close()
+		}
+		// [Phase 2] Close IPC tracking hooks
+		if d.links.CheckMmap != nil {
+			d.links.CheckMmap.Close()
+		}
+		if d.links.CheckPtrace != nil {
+			d.links.CheckPtrace.Close()
+		}
+		if d.links.CheckShmat != nil {
+			d.links.CheckShmat.Close()
 		}
 		if d.links.MirageReadEnter != nil {
 			d.links.MirageReadEnter.Close()
@@ -1184,10 +1307,11 @@ func (d *TelosDaemon) executeFailClosed() {
 	log.Println("[FAIL-CLOSED] Enforcement remains active (Zero-Trust). Traffic is blackholed.")
 }
 
-// === PHASE 1: ORPHAN CLEANUP ===
+// === PHASE 1: ORPHAN CLEANUP + PHASE 4: MAP UTILIZATION SAMPLING ===
 
 // orphanCleanupRoutine periodically purges dead processes from the BPF LRU map
 // to prevent map contention and eviction vulnerabilities.
+// Also samples BPF map sizes for Prometheus fleet governance metrics.
 func (d *TelosDaemon) orphanCleanupRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1201,6 +1325,7 @@ func (d *TelosDaemon) orphanCleanupRoutine() {
 			var pid uint32
 			var info ProcessInfo
 			var evicted uint32
+			var alive uint32
 
 			iterator := d.maps.ProcessMap.Iterate()
 			for iterator.Next(&pid, &info) {
@@ -1212,12 +1337,169 @@ func (d *TelosDaemon) orphanCleanupRoutine() {
 					if err := d.maps.ProcessMap.Delete(&pid); err == nil {
 						evicted++
 					}
+				} else {
+					alive++
 				}
 			}
 
 			if evicted > 0 {
 				log.Printf("✓ Orphan Cleanup: Purged %d dead PID states from BPF LRU map", evicted)
 			}
+
+			// [Phase 3+4] Update Prometheus gauges
+			metricProcessMapSize.Set(float64(alive))
+			metricMapUtilization.WithLabelValues("process_map").Set(float64(alive))
+
+			// Sample network_map size
+			var netCount float64
+			var ipKey uint32
+			var netPolicy NetworkPolicy
+			netIter := d.maps.NetworkMap.Iterate()
+			for netIter.Next(&ipKey, &netPolicy) {
+				netCount++
+			}
+			metricMapUtilization.WithLabelValues("network_map").Set(netCount)
+
+			// Sample inode_map size
+			var inodeCount float64
+			var inoKey uint64
+			var inoPolicy InodePolicy
+			inoIter := d.maps.InodeMap.Iterate()
+			for inoIter.Next(&inoKey, &inoPolicy) {
+				inodeCount++
+			}
+			metricMapUtilization.WithLabelValues("inode_map").Set(inodeCount)
 		}
+	}
+}
+
+// === PHASE 3: NDJSON ALERT LOGGER ===
+
+const (
+	alertLogDir     = "/var/log/telos"
+	alertLogFile    = "/var/log/telos/alerts.json"
+	alertMaxSizeBytes = 50 * 1024 * 1024 // 50 MB
+)
+
+// NDJSONAlert is the structured alert format for SIEM ingestion
+type NDJSONAlert struct {
+	Timestamp  string `json:"timestamp"`
+	Hostname   string `json:"hostname"`
+	PID        uint32 `json:"pid"`
+	Comm       string `json:"comm"`
+	Action     string `json:"action"`
+	TaintLevel uint32 `json:"taint_level"`
+	Blocked    bool   `json:"blocked"`
+	Engine     string `json:"engine"`
+}
+
+// initAlertLogger creates the NDJSON log file and directory
+func (d *TelosDaemon) initAlertLogger() error {
+	if err := os.MkdirAll(alertLogDir, 0755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+
+	f, err := os.OpenFile(alertLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open alert log: %w", err)
+	}
+	d.alertFile = f
+	return nil
+}
+
+// writeAlertNDJSON writes a single event as a JSON line to the alert log
+func (d *TelosDaemon) writeAlertNDJSON(event BPFEvent) {
+	if d.alertFile == nil {
+		return
+	}
+
+	hostname, _ := os.Hostname()
+	alert := NDJSONAlert{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+		Hostname:   hostname,
+		PID:        event.PID,
+		Comm:       event.CommStr,
+		Action:     event.DescStr,
+		TaintLevel: event.TaintLevel,
+		Blocked:    event.Blocked == 1,
+		Engine:     "telos_core",
+	}
+
+	data, err := json.Marshal(alert)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+
+	d.alertMu.Lock()
+	defer d.alertMu.Unlock()
+
+	// Check file size for rotation
+	if stat, err := d.alertFile.Stat(); err == nil {
+		if stat.Size() > alertMaxSizeBytes {
+			d.alertFile.Close()
+			os.Rename(alertLogFile, alertLogFile+".1")
+			f, err := os.OpenFile(alertLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Printf("[AlertLog] Failed to rotate: %v", err)
+				d.alertFile = nil
+				return
+			}
+			d.alertFile = f
+			log.Println("✓ Alert log rotated → alerts.json.1")
+		}
+	}
+
+	d.alertFile.Write(data)
+}
+
+// === PHASE 4: BULK THREAT INTEL FEED ===
+
+// cmdBulkBlockIPs accepts a JSON array of IPv4 addresses and batch-inserts
+// them into the network_map as blocked (allowed=0) entries.
+// This enables Cortex to push threat intel feed updates atomically.
+func (d *TelosDaemon) cmdBulkBlockIPs(data map[string]interface{}) IPCResponse {
+	ipsRaw, ok := data["ips"]
+	if !ok {
+		return IPCResponse{Success: false, Error: "missing 'ips' field"}
+	}
+
+	ipsList, ok := ipsRaw.([]interface{})
+	if !ok {
+		return IPCResponse{Success: false, Error: "'ips' must be an array"}
+	}
+
+	blocked := 0
+	for _, ipRaw := range ipsList {
+		ipStr, ok := ipRaw.(string)
+		if !ok {
+			continue
+		}
+
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue // Skip non-IPv4
+		}
+
+		// Convert to network byte order (uint32)
+		ipKey := binary.BigEndian.Uint32(ip4)
+		policy := NetworkPolicy{Allowed: 0} // Block
+
+		if err := d.maps.NetworkMap.Update(&ipKey, &policy, ebpf.UpdateAny); err != nil {
+			log.Printf("[ThreatIntel] Failed to block %s: %v", ipStr, err)
+			continue
+		}
+		blocked++
+	}
+
+	log.Printf("✓ Threat Intel: Bulk-blocked %d IPs from feed", blocked)
+	return IPCResponse{
+		Success: true,
+		Data:    fmt.Sprintf("blocked %d IPs", blocked),
 	}
 }

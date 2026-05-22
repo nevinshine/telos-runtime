@@ -95,6 +95,24 @@ struct {
   __type(value, struct exec_policy_t);
 } exec_policy_map SEC(".maps");
 
+// [Phase 2] Tainted mmap inode map: tracks shared memory mappings created by
+// tainted processes. Any clean process that maps the same inode inherits taint.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u64);  // Inode number of the mapped file
+  __type(value, __u32); // Taint level of the originator
+} tainted_mmap_map SEC(".maps");
+
+// [Phase 2] Tainted SysV shmid map: tracks System V shared memory segments
+// created or attached by tainted processes.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u32);  // shmid
+  __type(value, __u32); // Taint level of the originator
+} tainted_shmid_map SEC(".maps");
+
 // Define AF_INET if missing
 #ifndef AF_INET
 #define AF_INET 2
@@ -421,6 +439,147 @@ int BPF_PROG(telos_task_alloc, struct task_struct *task,
   // The actual blocking happens in bprm_check_security via parent check
 
   return 0; // Always allow fork (blocking happens at execve)
+}
+
+// ============================================================
+// PHASE 2: ENHANCED TAINT PROVENANCE & IPC TRACKING
+// ============================================================
+
+/*
+ * Hook: mmap_file
+ *
+ * Intercepts mmap() calls to track cross-process taint propagation
+ * via shared memory mappings.
+ *
+ * If a TAINT_HIGH+ process creates a MAP_SHARED mapping, the backing
+ * file's inode is recorded. Any clean process that subsequently maps
+ * the same inode inherits the taint, closing the thread-laundering
+ * bypass vector described in the architecture report.
+ */
+SEC("lsm/mmap_file")
+int BPF_PROG(telos_check_mmap, struct file *file, unsigned long reqprot,
+             unsigned long prot, unsigned long flags) {
+  if (!file)
+    return 0; // Anonymous mappings (no backing file) - allow
+
+  __u32 pid = bpf_get_current_pid_tgid() >> 32;
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+
+  // Get the inode of the backing file
+  struct inode *inode = BPF_CORE_READ(file, f_inode);
+  if (!inode)
+    return 0;
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+
+  // Check if this is a shared mapping (MAP_SHARED = 0x01)
+  if (!(flags & 0x01))
+    return 0; // Private mapping, no cross-process risk
+
+  if (info && info->taint_level >= TAINT_HIGH) {
+    // Tainted process is creating a shared mapping.
+    // Record the inode so any future mapper inherits the taint.
+    __u32 taint = info->taint_level;
+    bpf_map_update_elem(&tainted_mmap_map, &ino, &taint, BPF_ANY);
+    emit_event(pid, info->taint_level, 0, "mmap_taint_src");
+  } else {
+    // Clean process is mapping. Check if the inode is already tainted.
+    __u32 *existing_taint = bpf_map_lookup_elem(&tainted_mmap_map, &ino);
+    if (existing_taint && *existing_taint >= TAINT_HIGH) {
+      // Propagate taint to this clean process
+      if (info) {
+        info->taint_level = *existing_taint;
+        bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+      } else {
+        // Process not tracked yet, create a new entry
+        struct process_info_t new_info = {};
+        new_info.pid = pid;
+        new_info.taint_level = *existing_taint;
+        bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+        bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+      }
+      emit_event(pid, *existing_taint, 0, "mmap_taint_inh");
+    }
+  }
+
+  return 0; // Always allow mmap (taint propagation is passive)
+}
+
+/*
+ * Hook: ptrace_access_check
+ *
+ * Blocks ptrace() calls where the target process holds TAINT_HIGH+.
+ * This prevents a clean process from using PTRACE_PEEKDATA to read
+ * sensitive data out of a tainted process's memory space, effectively
+ * bypassing the IFC boundary.
+ */
+SEC("lsm/ptrace_access_check")
+int BPF_PROG(telos_check_ptrace, struct task_struct *child,
+             unsigned int mode) {
+  // Get the target (child) PID
+  __u32 child_pid = BPF_CORE_READ(child, tgid);
+
+  // Check if the target is tainted
+  struct process_info_t *child_info =
+      bpf_map_lookup_elem(&process_map, &child_pid);
+  if (!child_info)
+    return 0; // Target not tracked, allow
+
+  if (child_info->taint_level >= TAINT_HIGH) {
+    __u32 caller_pid = bpf_get_current_pid_tgid() >> 32;
+    emit_event(caller_pid, child_info->taint_level, 1, "ptrace_denied");
+
+    struct telos_config_t *config = get_config();
+    __u32 enforce = config ? config->enabled : 1;
+    if (enforce) {
+      return -EPERM; // Block ptrace into tainted process
+    }
+  }
+
+  return 0;
+}
+
+/*
+ * Hook: shm_shmat
+ *
+ * Intercepts System V shared memory attachment (shmat).
+ * If the shared memory segment was created/attached by a tainted process,
+ * any process that attaches inherits the taint.
+ *
+ * Note: We use the shmid (embedded in the shp struct) to track taint.
+ */
+SEC("lsm/shm_shmat")
+int BPF_PROG(telos_check_shmat, struct kern_ipc_perm *shp, char *shmaddr,
+             int shmflg) {
+  __u32 pid = bpf_get_current_pid_tgid() >> 32;
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+
+  // Use the IPC object's id as our tracking key
+  __u32 ipc_id = BPF_CORE_READ(shp, id);
+
+  if (info && info->taint_level >= TAINT_HIGH) {
+    // Tainted process is attaching. Mark the segment.
+    __u32 taint = info->taint_level;
+    bpf_map_update_elem(&tainted_shmid_map, &ipc_id, &taint, BPF_ANY);
+    emit_event(pid, info->taint_level, 0, "shmat_taint_src");
+  } else {
+    // Clean process is attaching. Check if segment is tainted.
+    __u32 *existing_taint = bpf_map_lookup_elem(&tainted_shmid_map, &ipc_id);
+    if (existing_taint && *existing_taint >= TAINT_HIGH) {
+      if (info) {
+        info->taint_level = *existing_taint;
+        bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+      } else {
+        struct process_info_t new_info = {};
+        new_info.pid = pid;
+        new_info.taint_level = *existing_taint;
+        bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+        bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+      }
+      emit_event(pid, *existing_taint, 0, "shmat_taint_inh");
+    }
+  }
+
+  return 0; // Always allow attachment (taint propagation is passive)
 }
 
 /*
