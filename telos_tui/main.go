@@ -95,6 +95,8 @@ type model struct {
 	cortexLogChan chan string
 	spinner       spinner.Model
 	processes     map[int]*ProcessStatus
+	prevTotal     uint64
+	prevIdle      uint64
 }
 
 // Custom msg types for tea.Cmd
@@ -168,10 +170,26 @@ func getMemoryPercent() int {
 	return int(float64(total-available) / float64(total) * 100)
 }
 
-func getCPUPercent() float64 {
-	// A simple mock for CPU, reading /proc/stat correctly requires two samples.
-	// For immediate UI feedback without blocking, we'll return a static/simulated value.
-	return 12.4
+func makeDynamicBar(percent float64) string {
+	blocks := int(percent / 10.0)
+	if blocks < 0 {
+		blocks = 0
+	}
+	if blocks > 10 {
+		blocks = 10
+	}
+
+	solid := strings.Repeat("█", blocks)
+	empty := strings.Repeat("░", 10-blocks)
+
+	colorStyle := safeText
+	if percent > 85 {
+		colorStyle = alertText
+	} else if percent > 60 {
+		colorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")) // Amber
+	}
+
+	return colorStyle.Render(solid) + dimText.Render(empty)
 }
 
 // --- Background Workers ---
@@ -323,7 +341,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.mem = getMemoryPercent()
-		m.cpu = getCPUPercent()
+		
+		data, err := os.ReadFile("/proc/stat")
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 {
+				var cpu string
+				var user, nice, system, idle, iowait, irq, softirq, steal uint64
+				fmt.Sscanf(lines[0], "%s %d %d %d %d %d %d %d %d", &cpu, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal)
+				
+				idleTime := idle + iowait
+				totalTime := user + nice + system + idle + iowait + irq + softirq + steal
+				
+				if m.prevTotal > 0 {
+					deltaTotal := totalTime - m.prevTotal
+					deltaIdle := idleTime - m.prevIdle
+					m.cpu = (float64(deltaTotal-deltaIdle) / float64(deltaTotal)) * 100.0
+				}
+				
+				m.prevTotal = totalTime
+				m.prevIdle = idleTime
+			}
+		}
+
 		return m, tick()
 
 	case spinner.TickMsg:
@@ -349,10 +389,10 @@ func (m model) View() string {
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Bottom, header, "  ", status)
 
 	// 2. TOP CARDS (Horizontal Flexbox)
-	sysCard := cardBorder.Render(fmt.Sprintf("%s\nCPU  [%s] %.0f%%\nMEM  [%s] %d%%",
+	sysCard := cardBorder.Render(fmt.Sprintf("%s\nCPU  [%s] %02.0f%%\nMEM  [%s] %02d%%",
 		cardTitle.Render("SYSTEM VITALS"),
-		safeText.Render("████")+dimText.Render("░░░░░░"), m.cpu,
-		alertText.Render("███████")+dimText.Render("░░░"), m.mem,
+		makeDynamicBar(m.cpu), m.cpu,
+		makeDynamicBar(float64(m.mem)), m.mem,
 	))
 
 	netCard := cardBorder.Render(fmt.Sprintf("%s\nBLOCKED %10s\nALLOWED %10s",
