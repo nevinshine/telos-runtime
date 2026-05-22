@@ -318,20 +318,6 @@ int BPF_PROG(telos_check_file, struct file *file) {
     }
   }
 
-  // Fallback: Filename check (Legacy / Defense in Depth)
-  if (info->taint_level >= max_taint) {
-    char filename[32];
-    int ret = bpf_probe_read_kernel_str(&filename, sizeof(filename),
-                                        BPF_CORE_READ(dentry, d_name.name));
-    if (ret >= 0) {
-      if (filename[0] == 'i' && filename[1] == 'd' && filename[2] == '_') {
-        emit_event(tracked_pid, info->taint_level, 1, "open_name");
-        if (enforce)
-          return -EPERM;
-      }
-    }
-  }
-
   return 0; // Allow
 }
 

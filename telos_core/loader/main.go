@@ -290,6 +290,7 @@ func (d *TelosDaemon) Start() error {
 	log.Printf("✓ Events stream running on %s", d.eventsSocketPath)
 
 	go d.readEvents()
+	go d.orphanCleanupRoutine()
 
 	fmt.Println()
 	fmt.Println(Green + "  ╔═══════════════════════════════════════════════════════╗" + Reset)
@@ -1181,4 +1182,42 @@ func (d *TelosDaemon) executeFailClosed() {
 
 	log.Printf("[FAIL-CLOSED] Complete. Slammed %d open specific domains shut.", flushCount)
 	log.Println("[FAIL-CLOSED] Enforcement remains active (Zero-Trust). Traffic is blackholed.")
+}
+
+// === PHASE 1: ORPHAN CLEANUP ===
+
+// orphanCleanupRoutine periodically purges dead processes from the BPF LRU map
+// to prevent map contention and eviction vulnerabilities.
+func (d *TelosDaemon) orphanCleanupRoutine() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-ticker.C:
+			// Iterate over all PIDs in the map
+			var pid uint32
+			var info ProcessInfo
+			var evicted uint32
+
+			iterator := d.maps.ProcessMap.Iterate()
+			for iterator.Next(&pid, &info) {
+				// Check if process still exists in /proc
+				procPath := fmt.Sprintf("/proc/%d", pid)
+				_, err := os.Stat(procPath)
+				if os.IsNotExist(err) {
+					// Process is dead, delete from map
+					if err := d.maps.ProcessMap.Delete(&pid); err == nil {
+						evicted++
+					}
+				}
+			}
+
+			if evicted > 0 {
+				log.Printf("✓ Orphan Cleanup: Purged %d dead PID states from BPF LRU map", evicted)
+			}
+		}
+	}
 }
