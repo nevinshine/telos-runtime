@@ -10,4 +10,8 @@ DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 USER_PACKAGES="/home/${SUDO_USER:-$USER}/.local/lib/python3.14/site-packages"
 export PYTHONPATH="$USER_PACKAGES:$PYTHONPATH"
 
+# Forward custom socket path to daemon and cortex if set
+# Usage: TELOS_SOCKET_PATH=/tmp/telos.sock sudo ./telos start
+export TELOS_SOCKET_PATH="${TELOS_SOCKET_PATH:-}"
+
 exec python3 "$DIR/telos_cli.py" "$@"

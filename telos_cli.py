@@ -126,6 +126,12 @@ def cmd_start(extra_args: list[str]):
         sys.exit(1)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Honor TELOS_SOCKET_PATH env var by injecting --socket if not already specified
+    socket_path = os.environ.get("TELOS_SOCKET_PATH", "")
+    if socket_path and "--socket" not in extra_args:
+        extra_args = ["--socket", socket_path] + extra_args
+
     args_str = " ".join(extra_args)
 
     steps = [
@@ -298,7 +304,13 @@ def cmd_start(extra_args: list[str]):
 
     summary.add_row("┃", "gRPC", f"grpc://127.0.0.1:{cortex_port}")
     summary.add_row("┃", "DNS", "udp://127.0.0.1:5353")
-    summary.add_row("┃", "IPC", "/var/run/telos.sock")
+    socket_display = os.environ.get("TELOS_SOCKET_PATH", "/var/run/telos.sock")
+    # Check if --socket was passed as an explicit arg
+    for i, a in enumerate(extra_args):
+        if a == "--socket" and i + 1 < len(extra_args):
+            socket_display = extra_args[i + 1]
+            break
+    summary.add_row("┃", "IPC", socket_display)
     summary.add_row("┃", "Dashboard", "http://127.0.0.1:8088")
     summary.add_row("┃", "Daemon Log", str(DAEMON_LOG))
     summary.add_row("┃", "Cortex Log", str(CORTEX_LOG))
