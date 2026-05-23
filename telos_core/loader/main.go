@@ -146,7 +146,7 @@ type BPFLinks struct {
 	CheckExec          link.Link
 	CheckFile          link.Link
 	CheckConnect       link.Link
-	TaskAlloc          link.Link
+	SchedFork          link.Link
 	CheckMmap          link.Link // [Phase 2]
 	CheckPtrace        link.Link // [Phase 2]
 	CheckShmat         link.Link // [Phase 2]
@@ -323,6 +323,11 @@ func (d *TelosDaemon) Start() error {
 	}
 	log.Println("✓ eBPF program loaded and attached")
 
+	// Phase 6: Register maps with Sentinel VMI for NPT protection
+	if err := d.hekiBridge.ProtectMapPages(d.maps); err != nil {
+		log.Printf("Warning: HEKI map registration failed (Hypervisor not present?): %v", err)
+	}
+
 	// Initialize config
 	if err := d.initConfig(); err != nil {
 		return fmt.Errorf("failed to init config: %w", err)
@@ -464,17 +469,15 @@ func (d *TelosDaemon) loadBPF() error {
 		}
 	}
 
-	// Attach task_alloc
-	prog = coll.Programs["telos_task_alloc"]
+	// Attach sched_process_fork
+	prog = coll.Programs["telos_sched_fork"]
 	if prog != nil {
-		l, err := link.AttachLSM(link.LSMOptions{
-			Program: prog,
-		})
+		l, err := link.Tracepoint("sched", "sched_process_fork", prog, nil)
 		if err != nil {
-			log.Printf("Warning: Failed to attach task_alloc: %v", err)
+			log.Printf("Warning: Failed to attach sched_process_fork: %v", err)
 		} else {
-			d.links.TaskAlloc = l
-			log.Println("  → Attached lsm/task_alloc")
+			d.links.SchedFork = l
+			log.Println("  → Attached tracepoint/sched/sched_process_fork")
 		}
 	}
 
@@ -738,8 +741,11 @@ func (d *TelosDaemon) readEvents() {
 				metricNetworkBlocks.Inc() // ptrace blocks are security enforcement
 			}
 		}
-		if event.DescStr == "taint_elevate" || event.DescStr == "mmap_taint_inh" || event.DescStr == "shmat_taint_inh" {
+		if event.DescStr == "taint_elevate" || event.DescStr == "mmap_taint_inh" || event.DescStr == "shmat_taint_inh" || event.DescStr == "fork_taint" {
 			metricIfcElevations.Inc()
+		}
+		if event.DescStr == "fork_taint" {
+			metricProcessMapSize.Inc()
 		}
 		if event.DescStr == "mirage_fed" {
 			metricMirageFeeds.Inc()
@@ -1183,8 +1189,8 @@ func (d *TelosDaemon) Stop() {
 		if d.links.CheckConnect != nil {
 			d.links.CheckConnect.Close()
 		}
-		if d.links.TaskAlloc != nil {
-			d.links.TaskAlloc.Close()
+		if d.links.SchedFork != nil {
+			d.links.SchedFork.Close()
 		}
 		// [Phase 2] Close IPC tracking hooks
 		if d.links.CheckMmap != nil {
@@ -1264,6 +1270,7 @@ func (d *TelosDaemon) cmdIPCPing() IPCResponse {
 		var cfg Config
 		if err := d.maps.ConfigMap.Lookup(&key, &cfg); err == nil && cfg.Enabled == 0 {
 			cfg.Enabled = 1
+			HekiIntentUnlock()
 			d.maps.ConfigMap.Update(&key, &cfg, ebpf.UpdateAny)
 			log.Println("[RECOVERY] Cortex reconnect detected. Enforcement restored (Enabled = 1).")
 		}
@@ -1317,6 +1324,7 @@ func (d *TelosDaemon) executeFailOpen() {
 	}
 
 	cfg.Enabled = 0 // Disable -EPERM enforcement drops
+	HekiIntentUnlock()
 	if err := d.maps.ConfigMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		log.Printf("[Error] Fail-Open could not write to config_map: %v", err)
 		return
@@ -1533,6 +1541,7 @@ func (d *TelosDaemon) cmdBulkBlockIPs(data map[string]interface{}) IPCResponse {
 		ipKey := binary.BigEndian.Uint32(ip4)
 		policy := NetworkPolicy{Allowed: 0} // Block
 
+		HekiIntentUnlock()
 		if err := d.maps.NetworkMap.Update(&ipKey, &policy, ebpf.UpdateAny); err != nil {
 			log.Printf("[ThreatIntel] Failed to block %s: %v", ipStr, err)
 			continue

@@ -143,15 +143,17 @@ func (h *HekiBridge) sendBinaryRequest(req HekiRegistration) error {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Read response (1 byte: 1 = success, 0 = failure)
-	resp := make([]byte, 1)
+	// Read response (4 bytes: Nonce. 0 = failure)
+	resp := make([]byte, 4)
 	if _, err := conn.Read(resp); err != nil {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	if resp[0] != 1 {
+	nonce := binary.LittleEndian.Uint32(resp)
+	if nonce == 0 {
 		return fmt.Errorf("hypervisor rejected the registration")
 	}
+	hekiNonce = nonce
 
 	return nil
 }

@@ -418,27 +418,33 @@ int BPF_PROG(telos_check_connect, struct socket *sock, struct sockaddr *address,
 }
 
 /*
- * Hook: task_alloc (optional)
+ * Hook: sched_process_fork
  *
  * Track process creation to propagate taint to child processes.
- * If a tainted process forks, the child inherits the taint.
+ * If a tracked process forks, the child inherits the taint synchronously
+ * before it can run.
  */
-SEC("lsm/task_alloc")
-int BPF_PROG(telos_task_alloc, struct task_struct *task,
-             unsigned long clone_flags) {
-  __u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+SEC("tp/sched/sched_process_fork")
+int telos_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
+  __u32 parent_pid = ctx->parent_pid;
 
-  // Check if parent is tainted
+  // Check if parent is tracked
   struct process_info_t *parent_info =
       bpf_map_lookup_elem(&process_map, &parent_pid);
   if (!parent_info) {
     return 0; // Parent not tracked
   }
 
-  // If parent is tainted, log via ringbuf (not bpf_printk)
-  // The actual blocking happens in bprm_check_security via parent check
+  // If parent is tracked (including tainted), propagate to child instantly
+  struct process_info_t child_info = *parent_info;
+  child_info.pid = ctx->child_pid;
 
-  return 0; // Always allow fork (blocking happens at execve)
+  bpf_map_update_elem(&process_map, &child_info.pid, &child_info, BPF_ANY);
+
+  // Emit event to userspace (Daemon) for SIEM logging and Prometheus metrics
+  emit_event(child_info.pid, child_info.taint_level, 0, "fork_taint");
+
+  return 0;
 }
 
 // ============================================================

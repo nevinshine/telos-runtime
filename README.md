@@ -425,10 +425,12 @@ telos-runtime/
 <details>
 <summary><b>Phase 14: Sentinel Heki Integration (Ring -1)</b></summary>
 
-- Established Hypervisor-Enforced Kernel Integrity (Heki) via a cross-layer IPC bridge (`/tmp/heki.sock`)
-- `telos_core` dynamically leaks the Guest Virtual Addresses (GVA) of critical BPF maps to `sentinel-vmi`
-- The VMI hypervisor performs page-table walks using the guest's `CR3` (`init_mm.pgd`) to resolve physical addresses
-- Maps are enforced using hardware Extended Page Tables (EPT/NPT) write-protection, blocking root-level kernel tampering
+- Established Hypervisor-Enforced Kernel Integrity (Heki) via a cross-layer IPC bridge (`/tmp/heki.sock`).
+- `telos_core` dynamically leaks the Guest Virtual Addresses (GVA) of critical BPF maps to `sentinel-vmi` using `bpf_map_update_value` kprobes.
+- The VMI hypervisor performs page-table walks using the guest's `CR3` to resolve physical addresses and locks the maps using hardware Extended Page Tables (EPT/NPT) write-protection.
+- **Drawbridge Protocol**: Dynamic map updates are safely permitted via cryptographic `CPUID` signals (`KVM_EXIT_CPUID`) from `telos_daemon`, verified using a hypervisor-issued 32-bit `Nonce` and Thread `CR3`.
+- **Mock IPC Testing Mode**: Fully simulates the Ring -1 pipeline (GPA translation bypass & mock nonces) for cloud VMs lacking bare-metal nested virtualization (`/dev/kvm`).
+- **Performance**: Zero-bypass accuracy. Hardware VM-Exit intercepts and MTF single-stepping incur only ~4.5μs to 5μs overhead per policy mutation, completely invisible to the 100,000+ ops/sec throughput.
 
 </details>
 

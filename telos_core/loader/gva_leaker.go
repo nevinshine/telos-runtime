@@ -30,19 +30,8 @@ func LeakMapGVA(m *ebpf.Map) (uint64, error) {
 	var kprobeProg *ebpf.Program
 	var kprobeFunc string
 
-	switch info.Type {
-	case ebpf.Hash:
-		kprobeProg = coll.Programs["leak_htab"]
-		kprobeFunc = "htab_map_update_elem"
-	case ebpf.LRUHash:
-		kprobeProg = coll.Programs["leak_lru"]
-		kprobeFunc = "htab_lru_map_update_elem"
-	case ebpf.Array:
-		kprobeProg = coll.Programs["leak_array"]
-		kprobeFunc = "array_map_update_elem"
-	default:
-		return 0, fmt.Errorf("unsupported map type for GVA leak: %v", info.Type)
-	}
+	kprobeProg = coll.Programs["leak_any_map"]
+	kprobeFunc = "bpf_map_update_value"
 
 	kp, err := link.Kprobe(kprobeFunc, kprobeProg, nil)
 	if err != nil {

@@ -12,26 +12,8 @@ struct {
   __type(value, __u64);
 } gva_leak_map SEC(".maps");
 
-SEC("kprobe/htab_map_update_elem")
-int leak_htab(struct pt_regs *ctx) {
-    void *map_ptr = (void *)PT_REGS_PARM1(ctx);
-    __u32 key = 0;
-    __u64 gva = (__u64)map_ptr;
-    bpf_map_update_elem(&gva_leak_map, &key, &gva, BPF_ANY);
-    return 0;
-}
-
-SEC("kprobe/htab_lru_map_update_elem")
-int leak_lru(struct pt_regs *ctx) {
-    void *map_ptr = (void *)PT_REGS_PARM1(ctx);
-    __u32 key = 0;
-    __u64 gva = (__u64)map_ptr;
-    bpf_map_update_elem(&gva_leak_map, &key, &gva, BPF_ANY);
-    return 0;
-}
-
-SEC("kprobe/array_map_update_elem")
-int leak_array(struct pt_regs *ctx) {
+SEC("kprobe/bpf_map_update_value")
+int leak_any_map(struct pt_regs *ctx) {
     void *map_ptr = (void *)PT_REGS_PARM1(ctx);
     __u32 key = 0;
     __u64 gva = (__u64)map_ptr;
