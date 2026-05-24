@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            cortex/requirements.txt
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            telos_core/loader/go.sum
+            telos_edge/loader/go.sum
+            shared/go.sum
+            telos_tui/go.sum
+
+      - name: Install lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cortex/requirements.txt ruff
+
+      - name: Run lint checks
+        run: ./scripts/ci/run_lint.sh
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            cortex/requirements.txt
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            telos_core/loader/go.sum
+            telos_edge/loader/go.sum
+            shared/go.sum
+            telos_tui/go.sum
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cortex/requirements.txt
+
+      - name: Run test suite
+        run: ./scripts/ci/run_tests.sh
+
+  ebpf-build:
+    name: ebpf-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libbpf-dev \
+            linux-libc-dev \
+            llvm \
+            linux-tools-common
+
+          # Optional: on newer Ubuntu runners, this provides an unversioned bpftool binary.
+          sudo apt-get install -y --no-install-recommends bpftool || true
+          # Optional fallback source for pre-generated CO-RE vmlinux.h.
+          sudo apt-get install -y --no-install-recommends linux-bpf-dev || true
+
+          if ! sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)"; then
+            sudo apt-get install -y --no-install-recommends linux-tools-generic
+          fi
+
+      - name: Debug eBPF toolchain
+        run: |
+          uname -r
+          command -v clang || true
+          clang --version | head -n 1 || true
+          command -v bpftool || true
+          if [ -d /usr/lib/linux-tools ]; then
+            find /usr/lib/linux-tools -maxdepth 2 -type f -name bpftool -print || true
+          fi
+          find /usr/include -type f \( -path '*/linux/vmlinux.h' -o -path '*/linux/bpf/vmlinux.h' \) 2>/dev/null | head -n 20 || true
+          ls -la /sys/kernel/btf || true
+          ls -la /sys/kernel/btf/vmlinux || true
+
+      - name: Validate eBPF build
+        run: ./scripts/ci/build_ebpf.sh
+
+  ci-required:
+    name: ci-required
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - lint
+      - test
+      - ebpf-build
+    steps:
+      - name: Assert required CI jobs passed
+        run: |
+          echo "lint result: ${{ needs.lint.result }}"
+          echo "test result: ${{ needs.test.result }}"
+          echo "ebpf-build result: ${{ needs.ebpf-build.result }}"
+
+          if [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.ebpf-build.result }}" != "success" ]; then
+            echo "At least one required CI job failed."
+            exit 1
+          fi
+
+          echo "All required CI jobs succeeded."
