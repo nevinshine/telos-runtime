@@ -1,11 +1,14 @@
 """Tests for Guardian thread safety under concurrent access.
+
 Uses multiple threads to simulate concurrent agent registration,
 taint updates, and session binding — verifying no state corruption.
 """
 import threading
-import unittest
 import time
+import unittest
+
 from cortex.guardian import Guardian
+
 
 class GuardianThreadSafetyTests(unittest.TestCase):
     """Thread-safety tests for the Guardian class."""
@@ -95,6 +98,7 @@ class GuardianThreadSafetyTests(unittest.TestCase):
             guardian.get_session_count(), 10,
             f"Expected 10 sessions, got {guardian.get_session_count()}"
         )
+
         for i in range(10):
             pid = guardian.get_session_pid(f"session_{i}")
             self.assertEqual(pid, 3000, f"session_{i} -> {pid}, expected 3000")
@@ -206,6 +210,7 @@ class GuardianThreadSafetyTests(unittest.TestCase):
             t.join()
 
         self.assertEqual(len(errors), 0, f"Errors during read/write interleave: {errors}")
+
 
 if __name__ == "__main__":
     unittest.main()
