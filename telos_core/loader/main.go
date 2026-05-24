@@ -396,10 +396,10 @@ func (d *TelosDaemon) loadBPF() error {
 		InodeMap:        coll.Maps["inode_map"],
 		NetworkMap:      coll.Maps["network_map"],
 		ExecPolicyMap:   coll.Maps["exec_policy_map"],   // [Phase 5]
-		MirageMap:       coll.Maps["mirage_map"],         // [Phase 4]
-		HoneyDataMap:    coll.Maps["honey_data_map"],     // [Phase 4]
-		TaintedMmapMap:  coll.Maps["tainted_mmap_map"],   // [Phase 2]
-		TaintedShmidMap: coll.Maps["tainted_shmid_map"],  // [Phase 2]
+		MirageMap:       coll.Maps["mirage_map"],        // [Phase 4]
+		HoneyDataMap:    coll.Maps["honey_data_map"],    // [Phase 4]
+		TaintedMmapMap:  coll.Maps["tainted_mmap_map"],  // [Phase 2]
+		TaintedShmidMap: coll.Maps["tainted_shmid_map"], // [Phase 2]
 		Events:          coll.Maps["events"],
 	}
 
@@ -1427,8 +1427,8 @@ func (d *TelosDaemon) orphanCleanupRoutine() {
 // === PHASE 3: NDJSON ALERT LOGGER ===
 
 const (
-	alertLogDir     = "/var/log/telos"
-	alertLogFile    = "/var/log/telos/alerts.json"
+	alertLogDir       = "/var/log/telos"
+	alertLogFile      = "/var/log/telos/alerts.json"
 	alertMaxSizeBytes = 50 * 1024 * 1024 // 50 MB
 )
 

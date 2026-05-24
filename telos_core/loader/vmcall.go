@@ -8,8 +8,8 @@ void heki_intent_unlock(uint32_t nonce) {
     uint32_t ecx = nonce;
     uint32_t ebx = 0;
     uint32_t edx = 0;
-    
-    // Execute CPUID to trigger VMEXIT. 
+
+    // Execute CPUID to trigger VMEXIT.
     // KVM will intercept this and sentinel-vmi will catch the KVMI_EVENT_CPUID.
     asm volatile(
         "cpuid"
@@ -40,11 +40,11 @@ func HekiIntentUnlock() {
 		conn, err := net.Dial("unix", "/tmp/heki.sock")
 		if err == nil {
 			defer conn.Close()
-			buf := make([]byte, 49) // Match heki_registration size EXACTLY (49 bytes)
+			buf := make([]byte, 49)                             // Match heki_registration size EXACTLY (49 bytes)
 			binary.LittleEndian.PutUint32(buf[0:4], 0x4D4F434B) // "MOCK"
 			binary.LittleEndian.PutUint32(buf[4:8], hekiNonce)
 			conn.Write(buf)
-			
+
 			ack := make([]byte, 4)
 			conn.Read(ack)
 		}
