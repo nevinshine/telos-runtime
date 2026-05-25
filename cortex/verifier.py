@@ -116,6 +116,7 @@ class IntentVerifier:
             allowed_bins = exec_result[4]
         elif self.ei:
             # If no explicit exec actions provided, fallback to default safe + intent bins
+            from cortex.exec_intel import SAFE_BINARIES
             intent_bins = list(self.ei._get_allowed_for_intent(goal.lower()))
             safe_padding = [b for b in SAFE_BINARIES if b not in intent_bins]
             allowed_bins = (intent_bins + safe_padding)[:8]
