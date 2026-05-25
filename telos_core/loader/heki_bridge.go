@@ -45,7 +45,6 @@ type HekiRegistration struct {
 // Let's assume the response is also just a simple 1-byte success code or similar, or we just drop the response parsing.
 // Actually, to be safe, I'll just read 1 byte for success.
 
-
 // NewHekiBridge creates a bridge to sentinel-vmi.
 // Set TELOS_HEKI_VMI_SOCKET to the sentinel-vmi Unix socket path.
 func NewHekiBridge() *HekiBridge {
@@ -75,9 +74,9 @@ func (h *HekiBridge) ProtectMapPages(maps *BPFMaps) error {
 
 	// Build list of maps to protect
 	mapEntries := []struct {
-		name    string
-		m       *ebpf.Map
-		pin     string
+		name     string
+		m        *ebpf.Map
+		pin      string
 		critical bool
 	}{
 		{"process_map", maps.ProcessMap, filepath.Join(bpfPinPath, "process_map"), true},
@@ -105,7 +104,7 @@ func (h *HekiBridge) ProtectMapPages(maps *BPFMaps) error {
 		req := HekiRegistration{
 			Magic:      0x48454B49,
 			GVA:        gva,
-			Size:       4096, 
+			Size:       4096,
 			IsCritical: 0,
 		}
 		if entry.critical {
@@ -181,9 +180,9 @@ func (d *TelosDaemon) cmdHekiStatus() IPCResponse {
 	}
 
 	return IPCResponse{Success: true, Data: map[string]interface{}{
-		"enabled":     d.hekiBridge.IsEnabled(),
-		"connected":   d.hekiBridge.IsConnected(),
-		"vmi_socket":  d.hekiBridge.socketPath,
-		"status":      "operational",
+		"enabled":    d.hekiBridge.IsEnabled(),
+		"connected":  d.hekiBridge.IsConnected(),
+		"vmi_socket": d.hekiBridge.socketPath,
+		"status":     "operational",
 	}}
 }

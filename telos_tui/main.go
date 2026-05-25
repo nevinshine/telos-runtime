@@ -346,7 +346,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Action:    "ALLOW",
 			}
 		}
-		
+
 		proc := m.processes[pid]
 		proc.LastEvent = time.Now()
 		m.lsmHooks++
@@ -385,7 +385,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.mem = getMemoryPercent()
-		
+
 		data, err := os.ReadFile("/proc/stat")
 		if err == nil {
 			lines := strings.Split(string(data), "\n")
@@ -393,16 +393,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var cpu string
 				var user, nice, system, idle, iowait, irq, softirq, steal uint64
 				fmt.Sscanf(lines[0], "%s %d %d %d %d %d %d %d %d", &cpu, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal)
-				
+
 				idleTime := idle + iowait
 				totalTime := user + nice + system + idle + iowait + irq + softirq + steal
-				
+
 				if m.prevTotal > 0 {
 					deltaTotal := totalTime - m.prevTotal
 					deltaIdle := idleTime - m.prevIdle
 					m.cpu = (float64(deltaTotal-deltaIdle) / float64(deltaTotal)) * 100.0
 				}
-				
+
 				m.prevTotal = totalTime
 				m.prevIdle = idleTime
 			}
@@ -434,9 +434,9 @@ func (m model) renderBootSequence() string {
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("%s   %s\n\n", astroLogoStyle.Render("telos"), timeStyle.Render("v2.0.0")))
-	
+
 	line := astroLineStyle.String() + "\n"
-	
+
 	if m.bootStep >= 1 {
 		b.WriteString(line)
 		b.WriteString(fmt.Sprintf("%s  Cortex daemon synchronized          %s\n", stepIconStyle.String(), timeStyle.Render("12ms")))
@@ -524,7 +524,7 @@ func (m model) renderDashboard() string {
 		if i >= 6 {
 			break // Show max 6 rows
 		}
-		
+
 		pidStr := fmt.Sprintf("%d", p.PID)
 		if p.IsTainted || p.IsBlocked {
 			pidStr = headerStyle.Render("❯") + " " + pidStr
@@ -541,14 +541,14 @@ func (m model) renderDashboard() string {
 		}
 
 		action := fmt.Sprintf("[ %s ]", p.Action)
-		
+
 		row := lipgloss.JoinHorizontal(lipgloss.Left,
 			colPID.Render(pidStr),
 			colTarget.Render(p.Name),
 			colIntegrity.Render(integrity),
 			colState.Render(state),
 			colAction.Render(action))
-		
+
 		tableRows = append(tableRows, "  "+row)
 	}
 
@@ -560,7 +560,7 @@ func (m model) renderDashboard() string {
 
 	// 4. VERTICAL LIVE STREAM
 	streamHead := fmt.Sprintf(" %s %s", streamTitle.Render("EVENT STREAM"), arenaLine.Render(strings.Repeat("┈", 70)))
-	
+
 	var streamParts []string
 	start := len(m.events) - 8 // Show last 8 events
 	if start < 0 {
@@ -569,11 +569,11 @@ func (m model) renderDashboard() string {
 	for i := start; i < len(m.events); i++ {
 		streamParts = append(streamParts, "  "+m.events[i])
 	}
-	
+
 	if len(streamParts) == 0 {
 		streamParts = append(streamParts, "  "+dimText.Render("Waiting for live trace events..."))
 	}
-	
+
 	streamView := lipgloss.JoinVertical(lipgloss.Left, streamParts...)
 
 	// ASSEMBLE

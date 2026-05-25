@@ -153,14 +153,14 @@ func (d *TelosDaemon) cmdLoadSandbox(data map[string]interface{}) IPCResponse {
 	// 3. Return manifest info (actual kernel loading is a separate step
 	// that requires detaching current hooks first — dangerous in production)
 	result := map[string]interface{}{
-		"elf_path":     elfPath,
-		"lsm_hooks":   manifest.LSMHooks,
-		"xdp_programs": manifest.XDPPrograms,
-		"maps":         manifest.Maps,
-		"has_aarm_key": manifest.HasAARMKey,
+		"elf_path":      elfPath,
+		"lsm_hooks":     manifest.LSMHooks,
+		"xdp_programs":  manifest.XDPPrograms,
+		"maps":          manifest.Maps,
+		"has_aarm_key":  manifest.HasAARMKey,
 		"program_count": len(spec.Programs),
 		"map_count":     len(spec.Maps),
-		"status":       "parsed_and_verified",
+		"status":        "parsed_and_verified",
 	}
 
 	log.Printf("[ELF-LOADER] Sandbox ELF verified successfully: %s", elfPath)
