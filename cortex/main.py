@@ -671,8 +671,10 @@ def sync_filesystem_policy(config: dict, ipc: CoreIPCClient):
     
     count = 0
     for pattern in sensitive_patterns:
+        # Expand ~ to the user's home directory
+        expanded_pattern = os.path.expanduser(pattern)
         # Resolve wildcards
-        for filepath in glob.glob(pattern, recursive=True):
+        for filepath in glob.glob(expanded_pattern, recursive=True):
             try:
                 # specific check for shadow/passwd to mark as critical?
                 # For now, everything in sensitive_paths is CRITICAL (2)
