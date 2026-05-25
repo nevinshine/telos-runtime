@@ -36,7 +36,7 @@ char LICENSE[] SEC("license") = "GPL";
 
 // Process taint map: PID -> process_info_t
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct process_info_t);
@@ -81,7 +81,7 @@ struct {
 
 // Network allowlist map: IPv4 Address -> Allowed
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
   __type(key, __u32); // IPv4 Address
   __type(value, struct network_policy_t);
@@ -89,7 +89,7 @@ struct {
 
 // [Phase 5] Execution Allowlist map: PID -> exec_policy_t
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct exec_policy_t);
@@ -98,7 +98,7 @@ struct {
 // [Phase 2] Tainted mmap inode map: tracks shared memory mappings created by
 // tainted processes. Any clean process that maps the same inode inherits taint.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u64);  // Inode number of the mapped file
   __type(value, __u32); // Taint level of the originator
@@ -107,7 +107,7 @@ struct {
 // [Phase 2] Tainted SysV shmid map: tracks System V shared memory segments
 // created or attached by tainted processes.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
   __type(key, __u32);  // shmid
   __type(value, __u32); // Taint level of the originator
@@ -825,3 +825,44 @@ int BPF_KRETPROBE(mirage_sys_newfstatat_exit) { return mirage_fstat_exit(ctx); }
 // 3B. Exit from newfstat
 SEC("kretprobe/__x64_sys_newfstat")
 int BPF_KRETPROBE(mirage_sys_newfstat_exit) { return mirage_fstat_exit(ctx); }
+
+// ==========================================
+// PHASE 11: LIFECYCLE CLEANUP (LRU Fix)
+// ==========================================
+// Explicitly free resources from HASH maps when
+// the underlying kernel objects are destroyed to
+// prevent map exhaustion.
+
+/*
+ * Hook: task_free
+ * Cleans up process-specific maps when a task terminates.
+ */
+SEC("lsm/task_free")
+int BPF_PROG(telos_task_free, struct task_struct *task) {
+  __u32 pid = BPF_CORE_READ(task, tgid);
+  bpf_map_delete_elem(&process_map, &pid);
+  bpf_map_delete_elem(&exec_policy_map, &pid);
+  return 0;
+}
+
+/*
+ * Hook: inode_free_security
+ * Cleans up inode-specific taint maps when an inode is destroyed.
+ */
+SEC("lsm/inode_free_security")
+int BPF_PROG(telos_inode_free, struct inode *inode) {
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+  bpf_map_delete_elem(&tainted_mmap_map, &ino);
+  return 0;
+}
+
+/*
+ * Hook: shm_free_security
+ * Cleans up IPC shared memory taint maps when destroyed.
+ */
+SEC("lsm/shm_free_security")
+int BPF_PROG(telos_shm_free, struct kern_ipc_perm *shp) {
+  __u32 id = BPF_CORE_READ(shp, id);
+  bpf_map_delete_elem(&tainted_shmid_map, &id);
+  return 0;
+}
