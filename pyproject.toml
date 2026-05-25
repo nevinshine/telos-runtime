@@ -5,7 +5,7 @@ license = {text = "MIT"}
 version = "0.5.0"
 description = "Telos Runtime Security Engine"
 authors = [
-    { name = "Nevin Shine", email = "nevin@example.com" }
+    { name = "Nevin Shine", email = "nevinshine05@outlook.com" }
 ]
 dependencies = [
     "rich>=13.0.0",
