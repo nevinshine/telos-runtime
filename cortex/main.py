@@ -317,8 +317,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
 
             return protocol_pb2.IntentVerdict(
                 allowed=False,
-                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second",
-                policy_ttl_ms=1000
+                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second. 10s penalty applied.",
+                policy_ttl_ms=10000
             )
 
         # Verify Intent (Network + Execution gates)
