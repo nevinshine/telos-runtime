@@ -7,6 +7,8 @@ import socket
 import logging
 import struct
 import threading
+import time
+import concurrent.futures
 import dnslib
 from dnslib import DNSRecord, QTYPE, RR, A
 
@@ -27,6 +29,8 @@ class TelosDNSProxy:
         self.running = False
         self._cleanup_timers = []
         self._timer_lock = threading.Lock()
+        self._allowed_domains = {}
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
     def start(self):
         self.sock.bind((self.host, self.port))
@@ -42,6 +46,7 @@ class TelosDNSProxy:
                 timer.cancel()
             self._cleanup_timers.clear()
         try:
+            self.executor.shutdown(wait=False)
             self.sock.close()
         except:
             pass
@@ -49,8 +54,9 @@ class TelosDNSProxy:
     def allow_domain(self, domain: str, ttl_ms: int):
         """
         Manually pre-authorize a domain in the proxy (used by explicit DeclareIntent RPCs).
-        In a full implementation, this populates an LRU cache or Redis.
         """
+        expiry = time.time() + (ttl_ms / 1000.0)
+        self._allowed_domains[domain] = expiry
         log.info(f"[DNS] Authorized explicit intent for '{domain}' ({ttl_ms}ms)")
 
     def _schedule_drawbridge_cleanup(self, ip_int, ip_str, domain, ttl_seconds):
@@ -72,8 +78,8 @@ class TelosDNSProxy:
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(512)
-                # Handle each request in a lightweight thread to prevent blocking
-                threading.Thread(target=self._handle_request, args=(data, addr), daemon=True).start()
+                # Handle request using bounded thread pool
+                self.executor.submit(self._handle_request, data, addr)
             except Exception as e:
                 if self.running:
                     log.error(f"DNS listener error: {e}")
@@ -95,10 +101,19 @@ class TelosDNSProxy:
             # =======================================================
             # PHASE 4.2 - Domain Intelligence Engine Integration
             # =======================================================
-            decision, score, reason = self.di.classify(qname, "Fetch data") # Generic intent for unauthenticated DNS queries
+            if qname in self._allowed_domains and time.time() < self._allowed_domains[qname]:
+                decision = "ALLOW"
+                log.debug(f"[DNS] '{qname}' allowed via Intent pre-authorization")
+            else:
+                if qname in self._allowed_domains:
+                    del self._allowed_domains[qname] # Cleanup expired
+                decision, score, reason = self.di.classify(qname, "Fetch data")
             
-            if decision == "DENY":
-                log.warning(f"[DNS] 🚫 DENIED: '{qname}' blocked by Intelligence Engine (Score: {score}). Reason: {reason}")
+            if decision == "DENY" or decision == "ESCALATE":
+                if decision == "ESCALATE":
+                    log.warning(f"[DNS] ⚠️ ESCALATED: '{qname}' denied by default at DNS layer (Score: {score}). Reason: {reason}")
+                else:
+                    log.warning(f"[DNS] 🚫 DENIED: '{qname}' blocked by Intelligence Engine (Score: {score}). Reason: {reason}")
                 
                 # =======================================================
                 # PHASE 13 - Bridging Telos with Hyperion XDP
