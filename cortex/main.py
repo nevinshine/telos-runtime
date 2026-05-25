@@ -158,7 +158,31 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self.verifier = verifier
         self.dns = dns_proxy # [NEW]
         self.rate_limiter = RateLimiter()
+        self._penalty_until = {}
         log.info("TelosControlService initialized")
+
+    def _apply_execution_penalty(self, pid: int, duration: float):
+        """Applies an execution lock and schedules a release, ensuring shorter penalties don't override longer ones."""
+        now = time.monotonic()
+        current_exp = self._penalty_until.get(pid, 0)
+        new_exp = now + duration
+        
+        if new_exp > current_exp:
+            self._penalty_until[pid] = new_exp
+            self.ipc.send_update_exec(pid, [], mode=1)
+            
+            def cleanup(target_pid=pid):
+                # Only clear if the penalty hasn't been extended
+                if time.monotonic() >= self._penalty_until.get(target_pid, 0) - 0.1:
+                    try:
+                        self.ipc.send_clear_exec(target_pid)
+                        log.info(f"🔓 Exec Drawbridge released for PID {target_pid} (Penalty Expired)")
+                    except Exception:
+                        pass
+                        
+            t = threading.Timer(duration, cleanup)
+            t.daemon = True
+            t.start()
 
     def _validate_pid(
         self,
@@ -288,20 +312,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         if not self.rate_limiter.allow(request.agent_pid):
             log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
             # Push a lockdown policy to ensure malicious agents can't exploit rate limits
-            self.ipc.send_update_exec(request.agent_pid, [], mode=1)
             log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid} (Rate Limit Exceeded)")
-
-            # Schedule cleanup to lift the penalty after 1 second
-            def cleanup_exec(pid=request.agent_pid):
-                try:
-                    self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
-                except Exception:
-                    pass
-
-            timer_exec = threading.Timer(1.0, cleanup_exec)
-            timer_exec.daemon = True
-            timer_exec.start()
+            self._apply_execution_penalty(request.agent_pid, 1.0)
 
             return protocol_pb2.IntentVerdict(
                 allowed=False,
@@ -378,20 +390,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             log.warning(f"❌ Intent DENIED: {reason}")
             # [PHASE 5: Intent-Based Execution]
             if exec_actions:
-                self.ipc.send_update_exec(request.agent_pid, [], mode=1)
                 log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
-                
-                # Release after TTL
-                def cleanup_deny(pid=request.agent_pid):
-                    try:
-                        self.ipc.send_clear_exec(pid)
-                        log.info(f"🔓 Exec Drawbridge released for PID {pid}")
-                    except Exception:
-                        pass
-                    
-                timer_deny = threading.Timer(10.0, cleanup_deny)  # 10s penalty box
-                timer_deny.daemon = True
-                timer_deny.start()
+                self._apply_execution_penalty(request.agent_pid, 10.0)
         
         # Register this agent if not already known
         self.guardian.register_agent(request.agent_pid)
