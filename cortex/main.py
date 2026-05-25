@@ -158,6 +158,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self.verifier = verifier
         self.dns = dns_proxy # [NEW]
         self.rate_limiter = RateLimiter()
+        self._exec_expiries = {}
+        self._exec_expiries_lock = threading.Lock()
         log.info("TelosControlService initialized")
 
     def _validate_pid(
@@ -294,7 +296,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             log.info(f"🚫 Drawbridge locked COMPLETELY (Exec + Net) for PID {request.agent_pid} (Rate Limit Exceeded)")
 
             # Schedule cleanup to lift the penalty after 10 seconds
+            expected_expiry = time.time() + 10.0
+            with self._exec_expiries_lock:
+                self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+
             def cleanup_rate_limit(pid=request.agent_pid):
+                with self._exec_expiries_lock:
+                    if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                        return
                 try:
                     self.ipc.send_clear_exec(pid)
                     # Restore previous taint level
@@ -335,7 +344,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"🛡 Exec Drawbridge locked to: {allowed_bins}")
                 
                 # Schedule Cleanup Timer
+                expected_expiry = time.time() + (ttl_ms / 1000.0)
+                with self._exec_expiries_lock:
+                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+
                 def cleanup_exec(pid=request.agent_pid):
+                    with self._exec_expiries_lock:
+                        if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                            return
                     try:
                         self.ipc.send_clear_exec(pid)
                         log.info(f"🔓 Exec Drawbridge released for PID {pid}")
@@ -387,7 +403,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
                 
                 # Release after TTL
+                expected_expiry = time.time() + 10.0
+                with self._exec_expiries_lock:
+                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+
                 def cleanup_deny(pid=request.agent_pid):
+                    with self._exec_expiries_lock:
+                        if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                            return
                     try:
                         self.ipc.send_clear_exec(pid)
                         log.info(f"🔓 Exec Drawbridge released for PID {pid}")
