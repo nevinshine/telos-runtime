@@ -289,24 +289,29 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
             # Push a lockdown policy to ensure malicious agents can't exploit rate limits
             self.ipc.send_update_exec(request.agent_pid, [], mode=1)
-            log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid} (Rate Limit Exceeded)")
+            # Elevate taint to CRITICAL (4) to immediately sever all network connections
+            self.ipc.send_update_taint(request.agent_pid, 4) 
+            log.info(f"🚫 Drawbridge locked COMPLETELY (Exec + Net) for PID {request.agent_pid} (Rate Limit Exceeded)")
 
-            # Schedule cleanup to lift the penalty after 1 second
-            def cleanup_exec(pid=request.agent_pid):
+            # Schedule cleanup to lift the penalty after 10 seconds
+            def cleanup_rate_limit(pid=request.agent_pid):
                 try:
                     self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+                    # Restore previous taint level
+                    restored_taint = self.guardian.get_taint_level(pid)
+                    self.ipc.send_update_taint(pid, restored_taint)
+                    log.info(f"🔓 Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
                 except Exception:
                     pass
 
-            timer_exec = threading.Timer(1.0, cleanup_exec)
-            timer_exec.daemon = True
-            timer_exec.start()
+            timer_rl = threading.Timer(10.0, cleanup_rate_limit)
+            timer_rl.daemon = True
+            timer_rl.start()
 
             return protocol_pb2.IntentVerdict(
                 allowed=False,
-                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second",
-                policy_ttl_ms=1000
+                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second. 10s penalty applied.",
+                policy_ttl_ms=10000
             )
 
         # Verify Intent (Network + Execution gates)
