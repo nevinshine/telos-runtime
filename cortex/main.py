@@ -291,10 +291,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
 
             # Schedule cleanup to lift the penalty after 1 second
             def cleanup_exec(pid=request.agent_pid):
-                self.ipc.send_clear_exec(pid)
-                log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+                try:
+                    self.ipc.send_clear_exec(pid)
+                    log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+                except Exception:
+                    pass
 
             timer_exec = threading.Timer(1.0, cleanup_exec)
+            timer_exec.daemon = True
             timer_exec.start()
 
             return protocol_pb2.IntentVerdict(
@@ -325,10 +329,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 
                 # Schedule Cleanup Timer
                 def cleanup_exec(pid=request.agent_pid):
-                    self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    try:
+                        self.ipc.send_clear_exec(pid)
+                        log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    except Exception:
+                        pass
                     
                 timer_exec = threading.Timer(ttl_ms / 1000.0, cleanup_exec)
+                timer_exec.daemon = True
                 timer_exec.start()
 
             # [PHASE 3: Intent-Based Networking]
@@ -352,10 +360,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                             
                             # 4. Schedule Cleanup Timer
                             def cleanup(ip_to_remove=ip_int, domain_name=domain):
-                                self.ipc.remove_network_rule(ip_to_remove)
-                                log.info(f"🔒 Drawbridge raised for {domain_name}")
+                                try:
+                                    self.ipc.remove_network_rule(ip_to_remove)
+                                    log.info(f"🔒 Drawbridge raised for {domain_name}")
+                                except Exception:
+                                    pass
                                 
                             timer = threading.Timer(ttl_ms / 1000.0, cleanup)
+                            timer.daemon = True
                             timer.start()
                 except Exception as e:
                     log.warning(f"Failed to resolve/allow domain {domain} for IPC: {e}")
@@ -369,10 +381,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 
                 # Release after TTL
                 def cleanup_deny(pid=request.agent_pid):
-                    self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    try:
+                        self.ipc.send_clear_exec(pid)
+                        log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    except Exception:
+                        pass
                     
                 timer_deny = threading.Timer(10.0, cleanup_deny)  # 10s penalty box
+                timer_deny.daemon = True
                 timer_deny.start()
         
         # Register this agent if not already known
