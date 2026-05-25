@@ -1,5 +1,7 @@
 [project]
 name = "telos-runtime"
+readme = "README.md"
+license = {text = "MIT"}
 version = "0.5.0"
 description = "Telos Runtime Security Engine"
 authors = [
