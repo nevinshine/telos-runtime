@@ -5,6 +5,8 @@ description = "Telos Runtime Security Engine"
 authors = [
     { name = "Nevin Shine", email = "nevin@example.com" }
 ]
+readme = "README.md"
+license = { text = "MIT" }
 dependencies = [
     "rich>=13.0.0",
     "textual>=0.40.0",

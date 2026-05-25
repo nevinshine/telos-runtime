@@ -1,0 +1,16 @@
+**/.git
+**/.gitignore
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.mypy_cache
+**/.tox
+**/.coverage
+**/.venv
+**/venv
+**/env
+**/.env
+**/.aider*
+**/bin_old/
