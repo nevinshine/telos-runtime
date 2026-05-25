@@ -143,7 +143,7 @@ def _context_abort(context: grpc.ServicerContext, code: grpc.StatusCode, message
     abort = getattr(context, "abort", None)
     if callable(abort):
         abort(code, message)
-    raise ValueError(message)
+    raise grpc.RpcError(message)
 
 # === GRPC SERVICE IMPLEMENTATION ===
 
@@ -243,6 +243,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"[~] {level_name} taint recorded, no enforcement action")
                 return protocol_pb2.Ack(success=True, message="Taint recorded")
                 
+        except grpc.RpcError:
+            raise
         except Exception as e:
             log.error(f"ReportTaint error: {e}")
             return protocol_pb2.Ack(success=False, message=str(e))
