@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import time
+import tempfile
 from typing import Optional
 from cortex.logger import get_logger
 
@@ -23,10 +24,9 @@ class AuditTrail:
         db_dir = os.path.dirname(self.db_path) or '.'
         try:
             os.makedirs(db_dir, exist_ok=True)
-            # Verify write access by attempting to create/delete a temporary file
-            test_file = os.path.join(db_dir, ".audit_write_test")
-            with open(test_file, "w") as f:
-                pass
+            # Verify write access by safely creating a unique temporary file
+            fd, test_file = tempfile.mkstemp(dir=db_dir, prefix=".audit_write_test_")
+            os.close(fd)
             os.remove(test_file)
         except (PermissionError, OSError):
             # Fallback to local directory database for non-root / testing environments
