@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import time
+import tempfile
 from typing import Optional
 from cortex.logger import get_logger
 
@@ -13,8 +14,26 @@ class AuditTrail:
     """
     
     def __init__(self, db_path: str = "/var/log/telos/audit.db"):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(self.db_path) or '.', exist_ok=True)
+        # Allow overriding via environment variable
+        env_path = os.environ.get("TELOS_AUDIT_DB")
+        if env_path:
+            self.db_path = env_path
+        else:
+            self.db_path = db_path
+            
+        db_dir = os.path.dirname(self.db_path) or '.'
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            # Verify write access by safely creating a unique temporary file
+            fd, test_file = tempfile.mkstemp(dir=db_dir, prefix=".audit_write_test_")
+            os.close(fd)
+            os.remove(test_file)
+        except (PermissionError, OSError):
+            # Fallback to local directory database for non-root / testing environments
+            self.db_path = "telos_audit.db"
+            db_dir = "."
+            os.makedirs(db_dir, exist_ok=True)
+
         self._init_db()
 
     def _init_db(self):
