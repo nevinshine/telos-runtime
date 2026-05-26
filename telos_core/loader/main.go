@@ -35,6 +35,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/mdlayher/genetlink"
 	"github.com/mdlayher/netlink"
 	"github.com/prometheus/client_golang/prometheus"
@@ -384,6 +385,21 @@ func (d *TelosDaemon) Start() error {
 
 	// [Phase 13: Generic Netlink HECI Telemetry Bridge]
 	go d.StartHeciNetlinkListener()
+
+	// [Phase 15: Systemd Watchdog Integration]
+	daemon.SdNotify(false, daemon.SdNotifyReady)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				daemon.SdNotify(false, daemon.SdNotifyWatchdog)
+			case <-d.done:
+				return
+			}
+		}
+	}()
 
 	fmt.Println()
 	fmt.Println(Green + "  ╔═══════════════════════════════════════════════════════╗" + Reset)
