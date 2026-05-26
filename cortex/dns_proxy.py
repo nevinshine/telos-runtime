@@ -48,8 +48,8 @@ class TelosDNSProxy:
         try:
             self.executor.shutdown(wait=False)
             self.sock.close()
-        except:
-            pass
+        except Exception as e:
+            log.debug(f"Cleanup during stop: {e}")
 
     def allow_domain(self, domain: str, ttl_ms: int):
         """

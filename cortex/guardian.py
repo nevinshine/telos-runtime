@@ -13,6 +13,9 @@ import threading
 import time
 from typing import Dict, Optional, Set
 from dataclasses import dataclass, field
+from cortex.audit import AuditTrail
+from cortex.hyperion_client import HyperionClient
+import urllib.parse
 
 log = logging.getLogger('telos.guardian')
 
@@ -71,7 +74,15 @@ class Guardian:
 
         # Kernel-taint snapshot: PID -> taint_level
         # Used to avoid losing taint state across control-plane re-declarations.
+        # Kernel-taint snapshot: PID -> taint_level
+        # Used to avoid losing taint state across control-plane re-declarations.
         self._core_taint: Dict[int, int] = {}
+        
+        # Persistent SQLite audit trail (Phase 4 SIEM integration)
+        self.audit = AuditTrail()
+        
+        # M4: Hyperion XDP Bridge for Layer 7 -> Layer 2 blocking
+        self.hyperion = HyperionClient()
 
         log.info("Guardian initialized")
 
@@ -198,10 +209,22 @@ class Guardian:
             agent_pid = self._get_agent_pid_for_view_unlocked(source_id, session_id)
             if agent_pid and agent_pid in self._agents:
                 # Agent's taint is the max of all their views
+                # Agent's taint is the max of all their views
                 current_max = self._agents[agent_pid].taint_level
                 if level > current_max:
                     self._agents[agent_pid].taint_level = level
+                    self.audit.log_taint(agent_pid, current_max, level, source_id, url or "Taint escalated from view")
                     log.warning(f"Agent {agent_pid} taint escalated to {level}")
+                    
+                    # M4: Dynamic XDP Blocking on TAINT_CRITICAL (level 4)
+                    if level >= 4 and url:
+                        # Attempt to parse IP from URL to block at Layer 2
+                        parsed = urllib.parse.urlparse(url)
+                        hostname = parsed.hostname
+                        if hostname:
+                            # Assume it's an IP for the prototype, or block by hostname if we had DNS blocking
+                            # We'll just pass the hostname. If it's an IP, Hyperion will parse and block it.
+                            self.hyperion.block_ip(hostname)
 
     def get_taint_level(self, pid: int) -> int:
         """Get current taint level for an agent PID."""
@@ -226,7 +249,10 @@ class Guardian:
         """Reset taint level for an agent (after cooldown/verification)."""
         with self._lock:
             if pid in self._agents:
-                self._agents[pid].taint_level = 0
+                old_taint = self._agents[pid].taint_level
+                if old_taint > 0:
+                    self._agents[pid].taint_level = 0
+                    self.audit.log_taint(pid, old_taint, 0, "SYSTEM", "Taint cleared explicitly")
                 self._core_taint.pop(pid, None)
                 log.info(f"Taint cleared for agent {pid}")
 

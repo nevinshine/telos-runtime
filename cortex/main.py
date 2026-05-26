@@ -23,12 +23,12 @@ from typing import Dict, Optional
 
 import grpc
 import yaml
+import structlog
+import uuid
+from cortex.logger import setup_logging, get_logger, correlation_id
 import glob  # [NEW] For resolving wildcards
 import stat  # [NEW] For file stats
 import threading
-import socket
-import struct
-import tempfile
 
 
 # Add parent directory for imports
@@ -61,17 +61,7 @@ LOG_PATH = os.getenv(
     'TELOS_CORTEX_LOG',
     os.path.join(tempfile.gettempdir(), 'telos_cortex.log')
 )
-os.makedirs(os.path.dirname(LOG_PATH) or '.', exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_PATH)
-    ]
-)
-log = logging.getLogger('telos.cortex')
+log = setup_logging(LOG_PATH)
 
 
 # === RATE LIMITER (Token Bucket) ===
@@ -363,7 +353,6 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 timer_exec.start()
 
             # [PHASE 3: Intent-Based Networking]
-            import socket
             for domain in domains:
                 # 1. Authorize domain in DNS Proxy (Phase 4)
                 self.dns.allow_domain(domain, ttl_ms)
@@ -373,7 +362,6 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                     addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
                     for _, _, _, _, sockaddr in addr_info:
                         ip_str = sockaddr[0]
-                        import struct
                         packed = socket.inet_aton(ip_str)
                         ip_int = struct.unpack("!I", packed)[0]
                         
