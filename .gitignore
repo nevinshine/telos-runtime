@@ -42,3 +42,6 @@ logs/
 # Temp Files
 temp_*.py
 test_hyperion_bridge.py
+
+# Aider
+.aider*
