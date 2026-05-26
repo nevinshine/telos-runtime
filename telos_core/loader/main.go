@@ -93,6 +93,12 @@ type HoneyPayload struct {
 	Data   [256]byte
 }
 
+// MMIOKey matches the BPF LPM Trie structure for the hypervisor policy engine
+type MMIOKey struct {
+	PrefixLen uint32
+	PhysAddr  uint64
+}
+
 // Config matches the BPF struct config_t
 type Config struct {
 	MaxTaintForExec uint32
@@ -179,6 +185,9 @@ type TelosDaemon struct {
 	// [Phase 6: Heki EPT Preparation]
 	batcher    *MapBatcher
 	hekiBridge *HekiBridge
+
+	// [Phase 14: ARM64 MMIO Policy Engine]
+	mmioMap *ebpf.Map
 
 	listener       net.Listener
 	eventsListener net.Listener
@@ -364,6 +373,13 @@ func (d *TelosDaemon) Start() error {
 		log.Printf("Warning: NDJSON alert logger disabled: %v", err)
 	} else {
 		log.Println("✓ NDJSON alert logger active → /var/log/telos/alerts.json")
+	}
+
+	// [Phase 14: ARM64 MMIO Policy Engine Initialization]
+	if err := d.initMMIOMap(); err != nil {
+		log.Printf("Warning: MMIO Policy Map initialization failed: %v", err)
+	} else {
+		log.Println("✓ ARM64 MMIO Policy Engine LPM Trie initialized")
 	}
 
 	// [Phase 13: Generic Netlink HECI Telemetry Bridge]
@@ -683,6 +699,55 @@ func (d *TelosDaemon) StartHeciNetlinkListener() {
 			}
 		}
 	}
+}
+
+// [Phase 14: ARM64 MMIO Policy Engine]
+func (d *TelosDaemon) initMMIOMap() error {
+	mapPath := "/sys/fs/bpf/sentinel_mmio_policy"
+	
+	m, err := ebpf.LoadPinnedMap(mapPath, nil)
+	if err == nil {
+		d.mmioMap = m
+		return nil
+	}
+
+	spec := &ebpf.MapSpec{
+		Type:       ebpf.LPMTrie,
+		KeySize:    12, // 4 bytes (PrefixLen) + 8 bytes (PhysAddr)
+		ValueSize:  4,  // 4 bytes (uint32 policy bitmask)
+		MaxEntries: 1024,
+		Flags:      1,  // BPF_F_NO_PREALLOC
+	}
+
+	m, err = ebpf.NewMap(spec)
+	if err != nil {
+		return fmt.Errorf("failed to create MMIO policy map: %v", err)
+	}
+
+	if err := m.Pin(mapPath); err != nil {
+		return fmt.Errorf("failed to pin MMIO policy map: %v", err)
+	}
+
+	d.mmioMap = m
+	return nil
+}
+
+func (d *TelosDaemon) ApplyMMIOPolicy(baseAddr uint64, maskBits uint32, action uint32) error {
+	if d.mmioMap == nil {
+		return fmt.Errorf("MMIO map not initialized")
+	}
+
+	key := MMIOKey{
+		PrefixLen: 32 + maskBits,
+		PhysAddr:  baseAddr,
+	}
+
+	err := d.mmioMap.Put(&key, &action)
+	if err != nil {
+		return fmt.Errorf("failed to update MMIO policy map: %v", err)
+	}
+	log.Printf("[MMIO Policy] Enforced rule for range %x (Mask: %d, Action: %d)", baseAddr, maskBits, action)
+	return nil
 }
 
 // initConfig sets default configuration
