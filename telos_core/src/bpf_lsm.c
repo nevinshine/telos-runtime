@@ -36,7 +36,7 @@ char LICENSE[] SEC("license") = "GPL";
 
 // Process taint map: PID -> process_info_t
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct process_info_t);
@@ -81,7 +81,7 @@ struct {
 
 // Network allowlist map: IPv4 Address -> Allowed
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
   __type(key, __u32); // IPv4 Address
   __type(value, struct network_policy_t);
@@ -89,7 +89,7 @@ struct {
 
 // [Phase 5] Execution Allowlist map: PID -> exec_policy_t
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u32); // PID
   __type(value, struct exec_policy_t);
@@ -98,7 +98,7 @@ struct {
 // [Phase 2] Tainted mmap inode map: tracks shared memory mappings created by
 // tainted processes. Any clean process that maps the same inode inherits taint.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, __u64);  // Inode number of the mapped file
   __type(value, __u32); // Taint level of the originator
@@ -107,11 +107,20 @@ struct {
 // [Phase 2] Tainted SysV shmid map: tracks System V shared memory segments
 // created or attached by tainted processes.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
   __type(key, __u32);  // shmid
   __type(value, __u32); // Taint level of the originator
 } tainted_shmid_map SEC(".maps");
+
+// [Phase 4] Tainted IPC map: tracks anonymous inodes (pipes/socketpairs)
+// used for propagating taint across un-named file descriptors.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u64);  // Inode number of the pipe/socket
+  __type(value, __u32); // Taint level of the originator
+} tainted_ipc_map SEC(".maps");
 
 // Define AF_INET if missing
 #ifndef AF_INET
@@ -589,6 +598,103 @@ int BPF_PROG(telos_check_shmat, struct kern_ipc_perm *shp, char *shmaddr,
 }
 
 /*
+ * Hook: file_permission
+ *
+ * Tracks cross-process taint propagation via pipes and socketpairs.
+ * If a tainted process writes to an anonymous pipe/socket, its inode is tainted.
+ * If a clean process reads from a tainted pipe/socket, it inherits the taint.
+ * This is highly optimized and only triggers for S_IFIFO and S_IFSOCK.
+ */
+SEC("lsm/file_permission")
+int BPF_PROG(telos_check_file_permission, struct file *file, int mask) {
+  if (!file) return 0;
+  
+  struct inode *inode = BPF_CORE_READ(file, f_inode);
+  if (!inode) return 0;
+  
+  // Only track pipes (FIFO) and sockets
+  // S_IFMT = 0170000, S_IFIFO = 0010000, S_IFSOCK = 0140000
+  unsigned short mode = BPF_CORE_READ(inode, i_mode);
+  if ((mode & 0170000) != 0010000 && (mode & 0170000) != 0140000) {
+    return 0; // Not a pipe or socket
+  }
+  
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+  __u32 pid = bpf_get_current_pid_tgid() >> 32;
+  struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+  
+  // 1. MAY_WRITE: Taint the pipe if writer is tainted
+  if (mask & 2) { // MAY_WRITE = 2
+    if (info && info->taint_level >= TAINT_HIGH) {
+      __u32 taint = info->taint_level;
+      bpf_map_update_elem(&tainted_ipc_map, &ino, &taint, BPF_ANY);
+      emit_event(pid, info->taint_level, 0, "pipe_taint_src");
+    }
+  }
+  
+  // 2. MAY_READ: Inherit taint if pipe is tainted
+  if (mask & 1) { // MAY_READ = 1
+    __u32 *existing_taint = bpf_map_lookup_elem(&tainted_ipc_map, &ino);
+    if (existing_taint && *existing_taint >= TAINT_HIGH) {
+      if (!info || info->taint_level < *existing_taint) {
+        if (info) {
+          info->taint_level = *existing_taint;
+          bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+        } else {
+          struct process_info_t new_info = {};
+          new_info.pid = pid;
+          new_info.taint_level = *existing_taint;
+          bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+          bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+        }
+        emit_event(pid, *existing_taint, 0, "pipe_taint_inh");
+      }
+    }
+  }
+  
+  return 0;
+}
+
+/*
+ * Hook: file_receive
+ *
+ * Intercepts file descriptors passed between processes via SCM_RIGHTS
+ * over Unix domain sockets, preventing capability delegation bypasses.
+ */
+SEC("lsm/file_receive")
+int BPF_PROG(telos_check_file_receive, struct file *file) {
+  if (!file) return 0;
+  
+  struct inode *inode = BPF_CORE_READ(file, f_inode);
+  if (!inode) return 0;
+  
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+  __u32 *existing_taint = bpf_map_lookup_elem(&tainted_ipc_map, &ino);
+  
+  // If the received file descriptor points to a tainted IPC channel,
+  // taint the receiving process instantly upon reception.
+  if (existing_taint && *existing_taint >= TAINT_HIGH) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+    if (!info || info->taint_level < *existing_taint) {
+      if (info) {
+        info->taint_level = *existing_taint;
+        bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+      } else {
+        struct process_info_t new_info = {};
+        new_info.pid = pid;
+        new_info.taint_level = *existing_taint;
+        bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+        bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+      }
+      emit_event(pid, *existing_taint, 0, "scm_rights_inh");
+    }
+  }
+  
+  return 0;
+}
+
+/*
  * NEW Hook: ksys_read ENTRY
  * Resolve FD -> Inode, check Mirage map, stash user buffer.
  */
@@ -825,3 +931,44 @@ int BPF_KRETPROBE(mirage_sys_newfstatat_exit) { return mirage_fstat_exit(ctx); }
 // 3B. Exit from newfstat
 SEC("kretprobe/__x64_sys_newfstat")
 int BPF_KRETPROBE(mirage_sys_newfstat_exit) { return mirage_fstat_exit(ctx); }
+
+// ==========================================
+// PHASE 11: LIFECYCLE CLEANUP (LRU Fix)
+// ==========================================
+// Explicitly free resources from HASH maps when
+// the underlying kernel objects are destroyed to
+// prevent map exhaustion.
+
+/*
+ * Hook: task_free
+ * Cleans up process-specific maps when a task terminates.
+ */
+SEC("lsm/task_free")
+int BPF_PROG(telos_task_free, struct task_struct *task) {
+  __u32 pid = BPF_CORE_READ(task, tgid);
+  bpf_map_delete_elem(&process_map, &pid);
+  bpf_map_delete_elem(&exec_policy_map, &pid);
+  return 0;
+}
+
+/*
+ * Hook: inode_free_security
+ * Cleans up inode-specific taint maps when an inode is destroyed.
+ */
+SEC("lsm/inode_free_security")
+int BPF_PROG(telos_inode_free, struct inode *inode) {
+  __u64 ino = BPF_CORE_READ(inode, i_ino);
+  bpf_map_delete_elem(&tainted_mmap_map, &ino);
+  return 0;
+}
+
+/*
+ * Hook: shm_free_security
+ * Cleans up IPC shared memory taint maps when destroyed.
+ */
+SEC("lsm/shm_free_security")
+int BPF_PROG(telos_shm_free, struct kern_ipc_perm *shp) {
+  __u32 id = BPF_CORE_READ(shp, id);
+  bpf_map_delete_elem(&tainted_shmid_map, &id);
+  return 0;
+}

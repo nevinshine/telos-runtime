@@ -1,0 +1,32 @@
+name: 'Setup Environment'
+description: 'Shared environment setup for CI jobs (Python, Go, dependencies)'
+
+runs:
+  using: 'composite'
+
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+        cache: pip
+        cache-dependency-path: |
+          cortex/requirements.txt
+
+    - name: Setup Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.work
+        cache: true
+        cache-dependency-path: |
+          go.work.sum
+          telos_core/loader/go.sum
+          telos_edge/loader/go.sum
+          shared/go.sum
+          telos_tui/go.sum
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r cortex/requirements.txt
+      shell: bash

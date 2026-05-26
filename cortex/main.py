@@ -23,12 +23,12 @@ from typing import Dict, Optional
 
 import grpc
 import yaml
+import structlog
+import uuid
+from cortex.logger import setup_logging, get_logger, correlation_id
 import glob  # [NEW] For resolving wildcards
 import stat  # [NEW] For file stats
 import threading
-import socket
-import struct
-import tempfile
 
 
 # Add parent directory for imports
@@ -61,17 +61,7 @@ LOG_PATH = os.getenv(
     'TELOS_CORTEX_LOG',
     os.path.join(tempfile.gettempdir(), 'telos_cortex.log')
 )
-os.makedirs(os.path.dirname(LOG_PATH) or '.', exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_PATH)
-    ]
-)
-log = logging.getLogger('telos.cortex')
+log = setup_logging(LOG_PATH)
 
 
 # === RATE LIMITER (Token Bucket) ===
@@ -143,7 +133,7 @@ def _context_abort(context: grpc.ServicerContext, code: grpc.StatusCode, message
     abort = getattr(context, "abort", None)
     if callable(abort):
         abort(code, message)
-    raise ValueError(message)
+    raise grpc.RpcError(message)
 
 # === GRPC SERVICE IMPLEMENTATION ===
 
@@ -158,6 +148,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self.verifier = verifier
         self.dns = dns_proxy # [NEW]
         self.rate_limiter = RateLimiter()
+        self._exec_expiries = {}
+        self._exec_expiries_lock = threading.Lock()
         log.info("TelosControlService initialized")
 
     def _validate_pid(
@@ -243,6 +235,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"[~] {level_name} taint recorded, no enforcement action")
                 return protocol_pb2.Ack(success=True, message="Taint recorded")
                 
+        except grpc.RpcError:
+            raise
         except Exception as e:
             log.error(f"ReportTaint error: {e}")
             return protocol_pb2.Ack(success=False, message=str(e))
@@ -287,20 +281,36 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             log.warning(f"⚠ Rate limited: Agent {request.agent_pid} ({RATE_LIMIT_RPS} req/s exceeded)")
             # Push a lockdown policy to ensure malicious agents can't exploit rate limits
             self.ipc.send_update_exec(request.agent_pid, [], mode=1)
-            log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid} (Rate Limit Exceeded)")
+            # Elevate taint to CRITICAL (4) to immediately sever all network connections
+            self.ipc.send_update_taint(request.agent_pid, 4) 
+            log.info(f"🚫 Drawbridge locked COMPLETELY (Exec + Net) for PID {request.agent_pid} (Rate Limit Exceeded)")
 
-            # Schedule cleanup to lift the penalty after 1 second
-            def cleanup_exec(pid=request.agent_pid):
-                self.ipc.send_clear_exec(pid)
-                log.info(f"🔓 Exec Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+            # Schedule cleanup to lift the penalty after 10 seconds
+            expected_expiry = time.time() + 10.0
+            with self._exec_expiries_lock:
+                self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
 
-            timer_exec = threading.Timer(1.0, cleanup_exec)
-            timer_exec.start()
+            def cleanup_rate_limit(pid=request.agent_pid):
+                with self._exec_expiries_lock:
+                    if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                        return
+                try:
+                    self.ipc.send_clear_exec(pid)
+                    # Restore previous taint level
+                    restored_taint = self.guardian.get_taint_level(pid)
+                    self.ipc.send_update_taint(pid, restored_taint)
+                    log.info(f"🔓 Drawbridge released for PID {pid} (Rate Limit Penalty Expired)")
+                except Exception:
+                    pass
+
+            timer_rl = threading.Timer(10.0, cleanup_rate_limit)
+            timer_rl.daemon = True
+            timer_rl.start()
 
             return protocol_pb2.IntentVerdict(
                 allowed=False,
-                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second",
-                policy_ttl_ms=1000
+                reason=f"Rate limited: exceeded {RATE_LIMIT_RPS} requests/second. 10s penalty applied.",
+                policy_ttl_ms=10000
             )
 
         # Verify Intent (Network + Execution gates)
@@ -324,15 +334,25 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"🛡 Exec Drawbridge locked to: {allowed_bins}")
                 
                 # Schedule Cleanup Timer
+                expected_expiry = time.time() + (ttl_ms / 1000.0)
+                with self._exec_expiries_lock:
+                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+
                 def cleanup_exec(pid=request.agent_pid):
-                    self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    with self._exec_expiries_lock:
+                        if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                            return
+                    try:
+                        self.ipc.send_clear_exec(pid)
+                        log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    except Exception:
+                        pass
                     
                 timer_exec = threading.Timer(ttl_ms / 1000.0, cleanup_exec)
+                timer_exec.daemon = True
                 timer_exec.start()
 
             # [PHASE 3: Intent-Based Networking]
-            import socket
             for domain in domains:
                 # 1. Authorize domain in DNS Proxy (Phase 4)
                 self.dns.allow_domain(domain, ttl_ms)
@@ -342,7 +362,6 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                     addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
                     for _, _, _, _, sockaddr in addr_info:
                         ip_str = sockaddr[0]
-                        import struct
                         packed = socket.inet_aton(ip_str)
                         ip_int = struct.unpack("!I", packed)[0]
                         
@@ -352,10 +371,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                             
                             # 4. Schedule Cleanup Timer
                             def cleanup(ip_to_remove=ip_int, domain_name=domain):
-                                self.ipc.remove_network_rule(ip_to_remove)
-                                log.info(f"🔒 Drawbridge raised for {domain_name}")
+                                try:
+                                    self.ipc.remove_network_rule(ip_to_remove)
+                                    log.info(f"🔒 Drawbridge raised for {domain_name}")
+                                except Exception:
+                                    pass
                                 
                             timer = threading.Timer(ttl_ms / 1000.0, cleanup)
+                            timer.daemon = True
                             timer.start()
                 except Exception as e:
                     log.warning(f"Failed to resolve/allow domain {domain} for IPC: {e}")
@@ -368,11 +391,22 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
                 
                 # Release after TTL
+                expected_expiry = time.time() + 10.0
+                with self._exec_expiries_lock:
+                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+
                 def cleanup_deny(pid=request.agent_pid):
-                    self.ipc.send_clear_exec(pid)
-                    log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    with self._exec_expiries_lock:
+                        if time.time() < self._exec_expiries.get(pid, 0) - 0.1:
+                            return
+                    try:
+                        self.ipc.send_clear_exec(pid)
+                        log.info(f"🔓 Exec Drawbridge released for PID {pid}")
+                    except Exception:
+                        pass
                     
                 timer_deny = threading.Timer(10.0, cleanup_deny)  # 10s penalty box
+                timer_deny.daemon = True
                 timer_deny.start()
         
         # Register this agent if not already known
@@ -655,8 +689,10 @@ def sync_filesystem_policy(config: dict, ipc: CoreIPCClient):
     
     count = 0
     for pattern in sensitive_patterns:
+        # Expand ~ to the user's home directory
+        expanded_pattern = os.path.expanduser(pattern)
         # Resolve wildcards
-        for filepath in glob.glob(pattern, recursive=True):
+        for filepath in glob.glob(expanded_pattern, recursive=True):
             try:
                 # specific check for shadow/passwd to mark as critical?
                 # For now, everything in sensitive_paths is CRITICAL (2)

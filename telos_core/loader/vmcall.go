@@ -1,3 +1,5 @@
+//go:build amd64
+
 package main
 
 /*
@@ -13,8 +15,8 @@ void heki_intent_unlock(uint32_t nonce) {
     // KVM will intercept this and sentinel-vmi will catch the KVMI_EVENT_CPUID.
     asm volatile(
         "cpuid"
-        : "+a"(eax), "+b"(ebx), "+c"(ecx), "+d"(edx)
-        :
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(magic), "c"(nonce)
         : "memory"
     );
 }
@@ -23,6 +25,7 @@ import "C"
 import (
 	"encoding/binary"
 	"net"
+	"os"
 )
 
 // hekiNonce is established during the initial IPC registration with sentinel-vmi
@@ -37,7 +40,8 @@ func HekiIntentUnlock() {
 
 		// MOCK VMEXIT for demonstration: Send CPUID intent via IPC
 		// In a real environment, KVM intercepts the CPUID assembly above!
-		conn, err := net.Dial("unix", "/tmp/heki.sock")
+		socketPath := os.Getenv("TELOS_HEKI_VMI_SOCKET")
+		conn, err := net.Dial("unix", socketPath)
 		if err == nil {
 			defer conn.Close()
 			buf := make([]byte, 49)                             // Match heki_registration size EXACTLY (49 bytes)

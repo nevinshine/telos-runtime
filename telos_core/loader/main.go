@@ -738,7 +738,7 @@ func (d *TelosDaemon) readEvents() {
 			} else if event.DescStr == "exfil_blocked" || event.DescStr == "connect_denied" || event.DescStr == "connect_ipv6_denied" {
 				metricNetworkBlocks.Inc()
 			} else if event.DescStr == "ptrace_denied" {
-				metricNetworkBlocks.Inc() // ptrace blocks are security enforcement
+				metricExecBlocks.Inc() // ptrace blocks are security enforcement
 			}
 		}
 		if event.DescStr == "taint_elevate" || event.DescStr == "mmap_taint_inh" || event.DescStr == "shmat_taint_inh" || event.DescStr == "fork_taint" {

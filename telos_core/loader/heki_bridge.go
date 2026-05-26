@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -78,11 +79,11 @@ func (h *HekiBridge) ProtectMapPages(maps *BPFMaps) error {
 		pin      string
 		critical bool
 	}{
-		{"process_map", maps.ProcessMap, bpfPinPath + "/process_map", true},
-		{"network_map", maps.NetworkMap, bpfPinPath + "/network_map", true},
-		{"inode_map", maps.InodeMap, bpfPinPath + "/inode_map", true},
-		{"config_map", maps.ConfigMap, bpfPinPath + "/config_map", true},
-		{"exec_policy_map", maps.ExecPolicyMap, bpfPinPath + "/exec_policy_map", false},
+		{"process_map", maps.ProcessMap, filepath.Join(bpfPinPath, "process_map"), true},
+		{"network_map", maps.NetworkMap, filepath.Join(bpfPinPath, "network_map"), true},
+		{"inode_map", maps.InodeMap, filepath.Join(bpfPinPath, "inode_map"), true},
+		{"config_map", maps.ConfigMap, filepath.Join(bpfPinPath, "config_map"), true},
+		{"exec_policy_map", maps.ExecPolicyMap, filepath.Join(bpfPinPath, "exec_policy_map"), false},
 	}
 
 	// Send to sentinel-vmi

@@ -294,7 +294,7 @@
         // Send to background script
         chrome.runtime.sendMessage({
             type: 'taint_detected',
-            level: taintData.levelName,
+            level: taintData.level,
             payload: taintData.text,
             session_id: new URLSearchParams(window.location.search).get('telos_session') || '', // [NEW] Capture Session ID
             findings: {

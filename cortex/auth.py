@@ -66,6 +66,12 @@ class CortexAuthInterceptor(grpc.ServerInterceptor):
         self.token = get_auth_token(token)
 
     def intercept_service(self, continuation, handler_call_details):
+        import uuid
+        from cortex.logger import correlation_id
+        
+        # Assign a unique correlation ID to the current ContextVar for structured logging
+        correlation_id.set(str(uuid.uuid4()))
+        
         handler = continuation(handler_call_details)
         if handler is None:
             return None

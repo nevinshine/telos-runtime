@@ -201,16 +201,16 @@ class DomainIntel:
         return deletes
 
     def _build_typosquat_index(self):
-        """Build O(1) SymSpell deletion dictionary for the watchlist."""
+        """Build O(1) SymSpell deletion dictionary for the watchlist with deduplicated deletions."""
         self._ts_index = {}
         for watched in self._watchlist:
             watched_root = _extract_root_domain(watched)
             watch_base = watched_root.rsplit('.', 1)[0] if '.' in watched_root else watched_root
-            
-            for del_w in self._get_deletions(watched_root, max_dist=2):
-                self._ts_index.setdefault(del_w, set()).add(watched)
-                
-            for del_w in self._get_deletions(watch_base, max_dist=2):
+            deletions = (
+                self._get_deletions(watched_root, max_dist=2)
+                | self._get_deletions(watch_base, max_dist=2)
+            )
+            for del_w in deletions:
                 self._ts_index.setdefault(del_w, set()).add(watched)
 
     def classify(self, domain: str, intent: str) -> Tuple[str, int, str]:
@@ -314,28 +314,25 @@ class DomainIntel:
 
     def _check_typosquat(self, domain: str) -> Optional[str]:
         """
-        Check if domain is a typosquat of a watchlist domain.
-        Uses O(1) SymSpell deletion index + bounded Levenshtein.
-        Operates on root domain to defeat subdomain-squatting.
+        Check if domain is a typosquat of a watchlist domain using deduplicated SymSpell deletions and bounded Levenshtein.
         """
         root = _extract_root_domain(domain)
         normalized = _normalize_homoglyphs(root)
         norm_base = normalized.rsplit('.', 1)[0] if '.' in normalized else normalized
 
-        # Gather O(1) candidates from SymSpell index
+        deletions = (
+            self._get_deletions(normalized, max_dist=2)
+            | self._get_deletions(norm_base, max_dist=2)
+        )
         candidates = set()
-        for del_w in self._get_deletions(normalized, max_dist=2):
-            if del_w in self._ts_index:
-                candidates.update(self._ts_index[del_w])
-                
-        for del_w in self._get_deletions(norm_base, max_dist=2):
+        for del_w in deletions:
             if del_w in self._ts_index:
                 candidates.update(self._ts_index[del_w])
 
         # Run exact Levenshtein only against candidates
         for watched in candidates:
             watched_root = _extract_root_domain(watched)
-            
+
             # Compare root domains
             dist = _levenshtein(normalized, watched_root, max_dist=2)
             if 0 < dist <= 2:
@@ -372,12 +369,14 @@ class DomainIntel:
         """
         Persist an LLM verdict into the DB for future O(1) lookups.
         This is the self-learning mechanism.
+        Ensures LRU cache is cleared after DB update to prevent stale reads.
         """
         self.conn.execute(
             "INSERT OR REPLACE INTO domains (domain, category, trust, source, last_seen, threat_score, flags) VALUES (?, ?, ?, 'llm', strftime('%s','now'), 0, '')",
             (domain, category, trust)
         )
         self.conn.commit()
+        self._compute_classification.cache_clear()
         log.info("[DI] Learned: %s → %s (trust=%d)", domain, category, trust)
 
     def get_stats(self) -> Dict:

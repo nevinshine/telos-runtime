@@ -13,6 +13,7 @@ import json
 import socket
 import logging
 import threading
+import time
 from typing import Optional, Dict, Any
 
 log = logging.getLogger('telos.ipc')
@@ -36,6 +37,9 @@ class CoreIPCClient:
         self.sock: Optional[socket.socket] = None
         self.connected = False
         self._lock = threading.Lock()
+        self._next_reconnect_time = 0.0
+        self._reconnect_backoff = 1.0  # seconds
+        self._max_backoff = 60.0       # seconds
     
     def connect(self) -> bool:
         """
@@ -44,26 +48,38 @@ class CoreIPCClient:
         Returns True if connected, False otherwise.
         The client can operate without connection (standalone mode).
         """
+        now = time.time()
+        if now < self._next_reconnect_time:
+            return False
+
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sock.settimeout(CONNECT_TIMEOUT)
             self.sock.connect(self.socket_path)
             self.connected = True
+            self._reconnect_backoff = 1.0
+            self._next_reconnect_time = 0.0
             log.info(f"Connected to Core at {self.socket_path}")
             return True
             
         except FileNotFoundError:
-            log.warning(f"Core socket not found: {self.socket_path}")
-            self.connected = False
+            log.warning(f"Core socket not found: {self.socket_path} (backing off {self._reconnect_backoff}s)")
+            self._handle_connect_failure(now)
             return False
         except ConnectionRefusedError:
-            log.warning(f"Core connection refused: {self.socket_path}")
-            self.connected = False
+            log.warning(f"Core connection refused: {self.socket_path} (backing off {self._reconnect_backoff}s)")
+            self._handle_connect_failure(now)
             return False
         except Exception as e:
-            log.error(f"Core connection failed: {e}")
-            self.connected = False
+            log.error(f"Core connection failed: {e} (backing off {self._reconnect_backoff}s)")
+            self._handle_connect_failure(now)
             return False
+
+    def _handle_connect_failure(self, now: float) -> None:
+        """Update backoff timers on connection failure."""
+        self.connected = False
+        self._next_reconnect_time = now + self._reconnect_backoff
+        self._reconnect_backoff = min(self._reconnect_backoff * 2.0, self._max_backoff)
     
     def close(self) -> None:
         """Close the socket connection."""
@@ -103,11 +119,19 @@ class CoreIPCClient:
             payload = json.dumps(message) + '\n'
             
             with self._lock:
-                # Re-check connection inside lock just in case it dropped
-                if not self.connected:
+                # Check connection inside lock — the ONLY authoritative check.
+                # A concurrent _handle_disconnect() may have fired between the
+                # outer fast-path check above and this lock acquisition.
+                if not self.connected or self.sock is None:
                     if not self.connect():
                         return None
-                        
+                
+                # Defensive guard: connect() succeeded but sock is somehow None
+                if self.sock is None:
+                    log.error("IPC socket is None after successful connect()")
+                    self.connected = False
+                    return None
+
                 self.sock.sendall(payload.encode('utf-8'))
                 log.debug(f"Sent: {command} -> {data}")
                 
