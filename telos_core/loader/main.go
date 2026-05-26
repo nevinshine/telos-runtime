@@ -189,25 +189,25 @@ type TelosDaemon struct {
 var (
 	metricExecBlocks = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "telos_exec_blocks_total",
+			Name: "sentinel_exec_blocks_total",
 			Help: "Total number of unauthorized execve attempts blocked by Telos",
 		},
 	)
 	metricNetworkBlocks = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "telos_network_blocks_total",
+			Name: "sentinel_network_blocks_total",
 			Help: "Total number of unauthorized network connections blocked by Telos",
 		},
 	)
 	metricIfcElevations = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "telos_ifc_elevations_total",
+			Name: "sentinel_taint_escalations_total",
 			Help: "Total number of taint elevations triggered by sensitive file access",
 		},
 	)
 	metricActiveDrawbridges = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "telos_active_drawbridges",
+			Name: "sentinel_active_drawbridges",
 			Help: "Current number of actively allowed IP domains in the network_map",
 		},
 	)
@@ -215,20 +215,28 @@ var (
 	// [Phase 3] Enhanced Telemetry Metrics
 	metricProcessMapSize = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "telos_process_map_size",
+			Name: "sentinel_process_map_size",
 			Help: "Current number of tracked processes in the BPF LRU map",
 		},
 	)
 	metricMirageFeeds = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "telos_mirage_feeds_total",
+			Name: "sentinel_mirage_feeds_total",
 			Help: "Total number of Mirage deception payloads served to tainted agents",
 		},
 	)
-	metricXdpDrops = prometheus.NewCounter(
+	
+	metricEbpfEvents = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "telos_xdp_drops_total",
-			Help: "Total number of XDP packet drops (placeholder for XDP event aggregation)",
+			Name: "sentinel_ebpf_events_total",
+			Help: "Total number of syscalls intercepted or ring buffer events processed",
+		},
+	)
+
+	metricHeciBlocks = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sentinel_heci_blocks_total",
+			Help: "Counter for Ring -3 management commands denied by the Kprobes LKM",
 		},
 	)
 
@@ -249,7 +257,8 @@ func init() {
 	prometheus.MustRegister(metricActiveDrawbridges)
 	prometheus.MustRegister(metricProcessMapSize)
 	prometheus.MustRegister(metricMirageFeeds)
-	prometheus.MustRegister(metricXdpDrops)
+	prometheus.MustRegister(metricEbpfEvents)
+	prometheus.MustRegister(metricHeciBlocks)
 	prometheus.MustRegister(metricMapUtilization)
 	metricMapUtilization.WithLabelValues("process_map").Set(0)
 	metricMapUtilization.WithLabelValues("network_map").Set(0)
@@ -732,6 +741,9 @@ func (d *TelosDaemon) readEvents() {
 			idxAction = len(event.Action)
 		}
 		event.DescStr = string(event.Action[:idxAction])
+
+		// Global Event Counter
+		metricEbpfEvents.Inc()
 
 		// [Phase 12: Action Counting]
 		if event.Blocked == 1 {
