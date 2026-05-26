@@ -35,6 +35,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/mdlayher/genetlink"
+	"github.com/mdlayher/netlink"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -364,6 +366,9 @@ func (d *TelosDaemon) Start() error {
 		log.Println("✓ NDJSON alert logger active → /var/log/telos/alerts.json")
 	}
 
+	// [Phase 13: Generic Netlink HECI Telemetry Bridge]
+	go d.StartHeciNetlinkListener()
+
 	fmt.Println()
 	fmt.Println(Green + "  ╔═══════════════════════════════════════════════════════╗" + Reset)
 	fmt.Println(Green + "  ║" + Bold + "        TELOS CORE ONLINE - Enforcing Security         " + Reset + Green + "║" + Reset)
@@ -582,6 +587,102 @@ func (d *TelosDaemon) loadBPF() error {
 	}
 
 	return nil
+}
+
+// === PHASE 13: Generic Netlink HECI Bridge ===
+func (d *TelosDaemon) StartHeciNetlinkListener() {
+	// Connect to generic netlink
+	c, err := genetlink.Dial(nil)
+	if err != nil {
+		log.Printf("Warning: Failed to connect to generic netlink: %v", err)
+		return
+	}
+	defer c.Close()
+
+	// Get family information
+	family, err := c.GetFamily("SENTINEL_MEI")
+	if err != nil {
+		log.Printf("Warning: SENTINEL_MEI generic netlink family not found: %v (is sentinel_mei_hook.ko loaded?)", err)
+		return
+	}
+
+	// Find the multicast group ID for "heci_events"
+	var groupID uint32
+	found := false
+	for _, grp := range family.Groups {
+		if grp.Name == "heci_events" {
+			groupID = grp.ID
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		log.Printf("Warning: heci_events multicast group not found")
+		return
+	}
+
+	// Bind to the multicast group using the underlying netlink connection
+	if err := c.JoinGroup(groupID); err != nil {
+		log.Printf("Warning: Failed to join netlink multicast group: %v", err)
+		return
+	}
+
+	log.Printf("✓ HECI Netlink Bridge connected (Family: %d, Group: %d)", family.ID, groupID)
+
+	// Listen loop
+	for {
+		msgs, _, err := c.Receive()
+		if err != nil {
+			log.Printf("HECI netlink receive error: %v", err)
+			time.Sleep(1 * time.Second) // backoff
+			continue
+		}
+
+		for _, msg := range msgs {
+			// Cmd == 1 (SENTINEL_CMD_EVENT)
+			if msg.Header.Command != 1 {
+				continue
+			}
+
+			// Parse netlink attributes
+			attrs, err := netlink.UnmarshalAttributes(msg.Data)
+			if err != nil {
+				continue
+			}
+
+			for _, attr := range attrs {
+				// Attr == 1 (SENTINEL_ATTR_EVENT)
+				if attr.Type == 1 {
+					// Unpack the binary struct:
+					// struct sentinel_heci_event { u32 pid; u32 uid; u32 action; u8 guid[16]; } = 28 bytes
+					if len(attr.Data) != 28 {
+						continue
+					}
+
+					pid := binary.LittleEndian.Uint32(attr.Data[0:4])
+					uid := binary.LittleEndian.Uint32(attr.Data[4:8])
+					action := binary.LittleEndian.Uint32(attr.Data[8:12])
+					guidBytes := attr.Data[12:28]
+
+					// Format GUID (standard Little Endian UUID format: DWORD-WORD-WORD-BYTE[8])
+					guidStr := fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+						guidBytes[3], guidBytes[2], guidBytes[1], guidBytes[0],
+						guidBytes[5], guidBytes[4],
+						guidBytes[7], guidBytes[6],
+						guidBytes[8], guidBytes[9],
+						guidBytes[10], guidBytes[11], guidBytes[12], guidBytes[13], guidBytes[14], guidBytes[15])
+
+					if action == 1 { // DENY
+						metricHeciBlocks.Inc()
+						log.Printf("[HECI] Blocked ME Client %s from pid=%d uid=%d", guidStr, pid, uid)
+					} else {
+						log.Printf("[HECI] Logged ME Client %s from pid=%d uid=%d", guidStr, pid, uid)
+					}
+				}
+			}
+		}
+	}
 }
 
 // initConfig sets default configuration
