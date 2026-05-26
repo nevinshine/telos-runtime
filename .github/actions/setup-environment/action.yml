@@ -1,11 +1,10 @@
 name: 'Setup Environment'
 description: 'Shared environment setup for CI jobs (Python, Go, dependencies)'
+
 runs:
   using: 'composite'
-  steps:
-    - name: Checkout
-      uses: actions/checkout@v5
 
+  steps:
     - name: Setup Python
       uses: actions/setup-python@v6
       with:
