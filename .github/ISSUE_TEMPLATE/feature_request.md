@@ -1,12 +1,10 @@
 ---
-name: ✨ Feature request
+name: Feature request
 about: Suggest an idea or enhancement for telos-runtime
 title: '[FEATURE] '
 labels: ['enhancement']
 assignees: ''
-
 ---
-
 ## Mandatory Checklist
 - [ ] I have checked the CLI help (`sudo ./telos help` or `status`) and existing documentation to ensure this feature isn't already implemented.
 - [ ] I have searched the existing issues to make sure this feature request is not a duplicate.

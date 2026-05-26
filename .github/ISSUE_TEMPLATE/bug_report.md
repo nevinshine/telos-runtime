@@ -1,12 +1,10 @@
 ---
-name: 🐛 Bug report
+name: Bug report
 about: Create a report to help us improve telos-runtime
 title: '[BUG] '
 labels: ['bug']
 assignees: ''
-
 ---
-
 ## System Environment
 <!-- Since Telos is a low-level eBPF systems project, the environment details are critical. Please fill these out accurately. -->
 - **Kernel version (`uname -r`):** 
