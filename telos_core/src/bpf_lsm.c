@@ -59,11 +59,13 @@ struct {
 
 // Ringbuf for sending events to userspace (audit log)
 struct event_t {
+  __u64 context_val;
   __u32 pid;
   __u32 taint_level;
   __u32 blocked;
   char comm[16];
-  char action[16]; // "execve" or "open"
+  char action[16];
+  __u32 padding;
 };
 
 struct {
@@ -135,16 +137,18 @@ static __always_inline struct telos_config_t *get_config(void) {
 }
 
 static __always_inline void emit_event(__u32 pid, __u32 taint, __u32 blocked,
-                                       const char *action) {
+                                       const char *action, __u64 context_val) {
   struct event_t *event;
 
   event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
   if (!event)
     return;
 
+  event->context_val = context_val;
   event->pid = pid;
   event->taint_level = taint;
   event->blocked = blocked;
+  event->padding = 0;
   bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
   // Copy action string (max 15 chars + null)
@@ -200,7 +204,7 @@ int BPF_PROG(telos_check_exec, struct linux_binprm *bprm) {
 
   // Check if taint exceeds threshold
   if (effective_taint > max_taint) {
-    emit_event(pid, effective_taint, 1, "exec_tainted");
+    emit_event(pid, effective_taint, 1, "exec_tainted", 0);
     if (enforce) {
       return -EPERM;
     }
@@ -257,7 +261,7 @@ int BPF_PROG(telos_check_exec, struct linux_binprm *bprm) {
     }
 
     if (!matched) {
-      emit_event(pid, effective_taint, 1, "exec_denied");
+      emit_event(pid, effective_taint, 1, "exec_denied", 0);
       if (enforce) {
         return -EPERM;
       }
@@ -317,7 +321,7 @@ int BPF_PROG(telos_check_file, struct file *file) {
     __u32 *honey_id = bpf_map_lookup_elem(&mirage_map, &ino);
     if (honey_id) {
       // Emit audit event but DO NOT BLOCK. Hand off to ksys_read interceptor.
-      emit_event(pid, info->taint_level, 0, "mirage_trap");
+      emit_event(pid, info->taint_level, 0, "mirage_trap", ino);
       return 0; // ALLOW!
     }
   }
@@ -331,13 +335,13 @@ int BPF_PROG(telos_check_file, struct file *file) {
     if (policy->sensitivity >= 2 && info->taint_level < TAINT_CRITICAL) {
       info->taint_level = TAINT_CRITICAL;
       bpf_map_update_elem(&process_map, &tracked_pid, info, BPF_ANY);
-      emit_event(tracked_pid, info->taint_level, 0, "taint_elevate");
+      emit_event(tracked_pid, info->taint_level, 0, "taint_elevate", ino);
     }
 
     // Now enforce the policy against the mutated (or existing) taint level
     if (info->taint_level >= max_taint) {
       // Inode is sensitive!
-      emit_event(tracked_pid, info->taint_level, 1, "open_inode");
+      emit_event(tracked_pid, info->taint_level, 1, "open_inode", ino);
 
       if (enforce) {
         return -EPERM;
@@ -389,8 +393,14 @@ int BPF_PROG(telos_check_connect, struct socket *sock, struct sockaddr *address,
   // CRITICAL. We MUST instantly drop all network connections to prevent data
   // exfiltration, regardless of what the AI explicitly allowed in the network
   // map.
+  __u64 context_val = 0;
+  if (address && address->sa_family == AF_INET) {
+    struct sockaddr_in *addr = (struct sockaddr_in *)address;
+    context_val = addr->sin_addr.s_addr;
+  }
+
   if (info->taint_level >= TAINT_CRITICAL) {
-    emit_event(tracked_pid, info->taint_level, 1, "exfil_blocked");
+    emit_event(tracked_pid, info->taint_level, 1, "exfil_blocked", context_val);
     if (enforce) {
       return -EPERM;
     }
@@ -398,7 +408,7 @@ int BPF_PROG(telos_check_connect, struct socket *sock, struct sockaddr *address,
 
   // 1. Blackhole IPv6 for tracked AI agents to prevent firewall bypass
   if (address->sa_family == AF_INET6) {
-    emit_event(tracked_pid, info->taint_level, 1, "connect_ipv6_denied");
+    emit_event(tracked_pid, info->taint_level, 1, "connect_ipv6_denied", 0);
     if (enforce) {
       return -EPERM;
     }
@@ -416,7 +426,7 @@ int BPF_PROG(telos_check_connect, struct socket *sock, struct sockaddr *address,
   struct network_policy_t *policy = bpf_map_lookup_elem(&network_map, &dest_ip);
   if (!policy || policy->allowed != 1) {
     // Block! ALL tracked processes are blocked by default unless allowed.
-    emit_event(pid, info->taint_level, 1, "connect_denied");
+    emit_event(pid, info->taint_level, 1, "connect_denied", dest_ip);
 
     if (enforce) {
       return -EPERM;
@@ -451,7 +461,7 @@ int telos_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
   bpf_map_update_elem(&process_map, &child_info.pid, &child_info, BPF_ANY);
 
   // Emit event to userspace (Daemon) for SIEM logging and Prometheus metrics
-  emit_event(child_info.pid, child_info.taint_level, 0, "fork_taint");
+  emit_event(child_info.pid, child_info.taint_level, 0, "fork_taint", 0);
 
   return 0;
 }
@@ -495,7 +505,7 @@ int BPF_PROG(telos_check_mmap, struct file *file, unsigned long reqprot,
     // Record the inode so any future mapper inherits the taint.
     __u32 taint = info->taint_level;
     bpf_map_update_elem(&tainted_mmap_map, &ino, &taint, BPF_ANY);
-    emit_event(pid, info->taint_level, 0, "mmap_taint_src");
+    emit_event(pid, info->taint_level, 0, "mmap_taint_src", ino);
   } else {
     // Clean process is mapping. Check if the inode is already tainted.
     __u32 *existing_taint = bpf_map_lookup_elem(&tainted_mmap_map, &ino);
@@ -512,7 +522,7 @@ int BPF_PROG(telos_check_mmap, struct file *file, unsigned long reqprot,
         bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
         bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
       }
-      emit_event(pid, *existing_taint, 0, "mmap_taint_inh");
+      emit_event(pid, *existing_taint, 0, "mmap_taint_inh", ino);
     }
   }
 
@@ -541,7 +551,7 @@ int BPF_PROG(telos_check_ptrace, struct task_struct *child,
 
   if (child_info->taint_level >= TAINT_HIGH) {
     __u32 caller_pid = bpf_get_current_pid_tgid() >> 32;
-    emit_event(caller_pid, child_info->taint_level, 1, "ptrace_denied");
+    emit_event(caller_pid, child_info->taint_level, 1, "ptrace_denied", child_pid);
 
     struct telos_config_t *config = get_config();
     __u32 enforce = config ? config->enabled : 1;
@@ -575,7 +585,7 @@ int BPF_PROG(telos_check_shmat, struct kern_ipc_perm *shp, char *shmaddr,
     // Tainted process is attaching. Mark the segment.
     __u32 taint = info->taint_level;
     bpf_map_update_elem(&tainted_shmid_map, &ipc_id, &taint, BPF_ANY);
-    emit_event(pid, info->taint_level, 0, "shmat_taint_src");
+    emit_event(pid, info->taint_level, 0, "shmat_taint_src", ipc_id);
   } else {
     // Clean process is attaching. Check if segment is tainted.
     __u32 *existing_taint = bpf_map_lookup_elem(&tainted_shmid_map, &ipc_id);
@@ -590,7 +600,7 @@ int BPF_PROG(telos_check_shmat, struct kern_ipc_perm *shp, char *shmaddr,
         bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
         bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
       }
-      emit_event(pid, *existing_taint, 0, "shmat_taint_inh");
+      emit_event(pid, *existing_taint, 0, "shmat_taint_inh", ipc_id);
     }
   }
 
@@ -628,7 +638,7 @@ int BPF_PROG(telos_check_file_permission, struct file *file, int mask) {
     if (info && info->taint_level >= TAINT_HIGH) {
       __u32 taint = info->taint_level;
       bpf_map_update_elem(&tainted_ipc_map, &ino, &taint, BPF_ANY);
-      emit_event(pid, info->taint_level, 0, "pipe_taint_src");
+      emit_event(pid, info->taint_level, 0, "pipe_taint_src", ino);
     }
   }
   
@@ -647,7 +657,7 @@ int BPF_PROG(telos_check_file_permission, struct file *file, int mask) {
           bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
           bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
         }
-        emit_event(pid, *existing_taint, 0, "pipe_taint_inh");
+        emit_event(pid, *existing_taint, 0, "pipe_taint_inh", ino);
       }
     }
   }
@@ -687,7 +697,7 @@ int BPF_PROG(telos_check_file_receive, struct file *file) {
         bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
         bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
       }
-      emit_event(pid, *existing_taint, 0, "scm_rights_inh");
+      emit_event(pid, *existing_taint, 0, "scm_rights_inh", ino);
     }
   }
   
@@ -789,7 +799,7 @@ int BPF_KRETPROBE(mirage_read_exit) {
         long err =
             bpf_probe_write_user(state->user_buf, payload->data, write_len);
         if (err == 0) {
-          emit_event(pid_tgid >> 32, TAINT_CRITICAL, 0, "mirage_fed");
+          emit_event(pid_tgid >> 32, TAINT_CRITICAL, 0, "mirage_fed", 0);
         }
       }
     }

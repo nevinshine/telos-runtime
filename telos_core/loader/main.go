@@ -111,9 +111,8 @@ type IPCResponse struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// BPFEvent represents an event from the kernel ringbuffer
-// Must exactly match memory layout of event_t in bpf_lsm.c
 type BPFEvent struct {
+	ContextVal uint64   `json:"context_val"`
 	PID        uint32   `json:"pid"`
 	TaintLevel uint32   `json:"taint_level"`
 	Blocked    uint32   `json:"blocked"`
@@ -698,19 +697,22 @@ func (d *TelosDaemon) readEvents() {
 		}
 
 		var rawEvent struct {
+			ContextVal uint64
 			PID        uint32
 			TaintLevel uint32
 			Blocked    uint32
 			Comm       [16]byte
 			Action     [16]byte
+			Padding    uint32
 		}
 
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &rawEvent); err != nil {
-			log.Printf("[Error] Failed to read BPFEvent from ringbuf: %v (raw size: %d, expected: 44)", err, len(record.RawSample))
+			log.Printf("[Error] Failed to read BPFEvent from ringbuf: %v (raw size: %d, expected: 56)", err, len(record.RawSample))
 			continue
 		}
 
 		event := BPFEvent{
+			ContextVal: rawEvent.ContextVal,
 			PID:        rawEvent.PID,
 			TaintLevel: rawEvent.TaintLevel,
 			Blocked:    rawEvent.Blocked,
