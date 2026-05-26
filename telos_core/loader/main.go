@@ -369,11 +369,11 @@ func (d *TelosDaemon) Start() error {
 	go d.readEvents()
 	go d.orphanCleanupRoutine()
 
-	// [Phase 3] Initialize NDJSON alert logger
-	if err := d.initAlertLogger(); err != nil {
-		log.Printf("Warning: NDJSON alert logger disabled: %v", err)
+	// [Phase 32] Initialize Durable JSONL Audit Logger
+	if err := d.initDurableAuditLogger(); err != nil {
+		log.Printf("Warning: Durable Audit Logger disabled: %v", err)
 	} else {
-		log.Println("✓ NDJSON alert logger active → /var/log/telos/alerts.json")
+		log.Println("✓ Durable Audit Logger active → /var/log/sentinel/audit.jsonl")
 	}
 
 	// [Phase 14: ARM64 MMIO Policy Engine Initialization]
@@ -707,9 +707,29 @@ func (d *TelosDaemon) StartHeciNetlinkListener() {
 
 					if action == 1 { // DENY
 						metricHeciBlocks.Inc()
-						log.Printf("[HECI] Blocked ME Client %s from pid=%d uid=%d", guidStr, pid, uid)
+						d.EmitAudit(SentinelAuditEvent{
+							Component: "SMM",
+							EventType: "HECI_BLOCK",
+							Severity:  "CRITICAL",
+							Action:    "DENY",
+							Metadata: map[string]interface{}{
+								"pid":  pid,
+								"uid":  uid,
+								"guid": guidStr,
+							},
+						})
 					} else {
-						log.Printf("[HECI] Logged ME Client %s from pid=%d uid=%d", guidStr, pid, uid)
+						d.EmitAudit(SentinelAuditEvent{
+							Component: "SMM",
+							EventType: "HECI_BLOCK",
+							Severity:  "INFO",
+							Action:    "ALLOW",
+							Metadata: map[string]interface{}{
+								"pid":  pid,
+								"uid":  uid,
+								"guid": guidStr,
+							},
+						})
 					}
 				}
 			}
@@ -947,8 +967,26 @@ func (d *TelosDaemon) readEvents() {
 			metricMirageFeeds.Inc()
 		}
 
-		// [Phase 3] Write to NDJSON alert log
-		d.writeAlertNDJSON(event)
+		// [Phase 32: Durable JSONL Audit]
+		actionStr := "ALLOW"
+		severityStr := "INFO"
+		if event.Blocked == 1 {
+			actionStr = "DENY"
+			severityStr = "WARNING"
+		}
+
+		d.EmitAudit(SentinelAuditEvent{
+			Component: "LSM",
+			EventType: "SYSCALL_VIOLATION",
+			Severity:  severityStr,
+			Action:    actionStr,
+			Metadata: map[string]interface{}{
+				"pid":         event.PID,
+				"comm":        event.CommStr,
+				"description": event.DescStr,
+				"taint_level": event.TaintLevel,
+			},
+		})
 
 		d.broadcastEvent(event)
 	}
@@ -1620,85 +1658,7 @@ func (d *TelosDaemon) orphanCleanupRoutine() {
 	}
 }
 
-// === PHASE 3: NDJSON ALERT LOGGER ===
 
-const (
-	alertLogDir       = "/var/log/telos"
-	alertLogFile      = "/var/log/telos/alerts.json"
-	alertMaxSizeBytes = 50 * 1024 * 1024 // 50 MB
-)
-
-// NDJSONAlert is the structured alert format for SIEM ingestion
-type NDJSONAlert struct {
-	Timestamp  string `json:"timestamp"`
-	Hostname   string `json:"hostname"`
-	PID        uint32 `json:"pid"`
-	Comm       string `json:"comm"`
-	Action     string `json:"action"`
-	TaintLevel uint32 `json:"taint_level"`
-	Blocked    bool   `json:"blocked"`
-	Engine     string `json:"engine"`
-}
-
-// initAlertLogger creates the NDJSON log file and directory
-func (d *TelosDaemon) initAlertLogger() error {
-	if err := os.MkdirAll(alertLogDir, 0755); err != nil {
-		return fmt.Errorf("create log dir: %w", err)
-	}
-
-	f, err := os.OpenFile(alertLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open alert log: %w", err)
-	}
-	d.alertFile = f
-	return nil
-}
-
-// writeAlertNDJSON writes a single event as a JSON line to the alert log
-func (d *TelosDaemon) writeAlertNDJSON(event BPFEvent) {
-	if d.alertFile == nil {
-		return
-	}
-
-	hostname, _ := os.Hostname()
-	alert := NDJSONAlert{
-		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
-		Hostname:   hostname,
-		PID:        event.PID,
-		Comm:       event.CommStr,
-		Action:     event.DescStr,
-		TaintLevel: event.TaintLevel,
-		Blocked:    event.Blocked == 1,
-		Engine:     "telos_core",
-	}
-
-	data, err := json.Marshal(alert)
-	if err != nil {
-		return
-	}
-	data = append(data, '\n')
-
-	d.alertMu.Lock()
-	defer d.alertMu.Unlock()
-
-	// Check file size for rotation
-	if stat, err := d.alertFile.Stat(); err == nil {
-		if stat.Size() > alertMaxSizeBytes {
-			d.alertFile.Close()
-			os.Rename(alertLogFile, alertLogFile+".1")
-			f, err := os.OpenFile(alertLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Printf("[AlertLog] Failed to rotate: %v", err)
-				d.alertFile = nil
-				return
-			}
-			d.alertFile = f
-			log.Println("✓ Alert log rotated → alerts.json.1")
-		}
-	}
-
-	d.alertFile.Write(data)
-}
 
 // === PHASE 4: BULK THREAT INTEL FEED ===
 
