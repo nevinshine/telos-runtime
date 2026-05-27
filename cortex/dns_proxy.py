@@ -16,8 +16,14 @@ from cortex.domain_intel import DomainIntel
 
 log = logging.getLogger('telos.dns')
 
+# TTL bounds for DNS-authorized firewall holes
+TTL_MIN = 60
+TTL_MAX = 3600
+MAX_PENDING_CLEANUPS = 10000
+CLEANUP_SLEEP_MAX = 1.0
+
 class TelosDNSProxy:
-    def __init__(self, ipc_client, host='127.0.0.1', port=5353, upstream_dns='8.8.8.8'):
+    def __init__(self, ipc_client, host='127.0.0.1', port=5353, upstream_dns='8.8.8.8', max_workers=20):
         self.host = host
         self.port = port
         self.upstream_dns = upstream_dns
@@ -27,10 +33,24 @@ class TelosDNSProxy:
         # Allow port reuse just in case
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.running = False
-        self._cleanup_timers = []
-        self._timer_lock = threading.Lock()
         self._allowed_domains = {}
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        
+        # Cleanup queue and refcounting
+        self._pending_cleanups = {}
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_event = threading.Event()
+        self._stop_event = threading.Event()
+        
+        self._ip_refcount = {}
+        self._ip_refcount_lock = threading.Lock()
+        
+        self._cleanup_worker = threading.Thread(
+            target=self._cleanup_loop,
+            daemon=True,
+            name='dns_cleanup_worker',
+        )
+        self._cleanup_worker.start()
 
     def start(self):
         self.sock.bind((self.host, self.port))
@@ -41,10 +61,19 @@ class TelosDNSProxy:
 
     def stop(self):
         self.running = False
-        with self._timer_lock:
-            for timer in self._cleanup_timers:
-                timer.cancel()
-            self._cleanup_timers.clear()
+        self._stop_event.set()
+        self._cleanup_event.set()
+        try:
+            if self._cleanup_worker.is_alive():
+                self._cleanup_worker.join(timeout=2.0)
+        except Exception as e:
+            log.debug(f"Cleanup worker join failed: {e}")
+            
+        with self._cleanup_lock:
+            self._pending_cleanups.clear()
+        with self._ip_refcount_lock:
+            self._ip_refcount.clear()
+            
         try:
             self.executor.shutdown(wait=False)
             self.sock.close()
@@ -59,20 +88,117 @@ class TelosDNSProxy:
         self._allowed_domains[domain] = expiry
         log.info(f"[DNS] Authorized explicit intent for '{domain}' ({ttl_ms}ms)")
 
-    def _schedule_drawbridge_cleanup(self, ip_int, ip_str, domain, ttl_seconds):
-        """Schedule removal of a firewall rule after TTL expires."""
-        def cleanup():
-            self.ipc.remove_network_rule(ip_int)
-            log.info(f"[DNS] 🔒 Drawbridge raised for '{domain}' ({ip_str}) after {ttl_seconds}s TTL")
-            with self._timer_lock:
-                if timer in self._cleanup_timers:
-                    self._cleanup_timers.remove(timer)
+    def _normalize_ttl(self, ttl_seconds, ip_int=None, domain=None):
+        ttl = int(ttl_seconds) if isinstance(ttl_seconds, (int, float)) else 0
+        if ttl <= 0:
+            ttl = TTL_MIN
+        if ttl < TTL_MIN:
+            log.debug(f"[DNS] TTL below minimum: requested={ttl_seconds}s, normalized={TTL_MIN}s for IP={ip_int} domain={domain}")
+            ttl = TTL_MIN
+        if ttl > TTL_MAX:
+            log.warning(f"[DNS] TTL capped: requested={ttl_seconds}s, capped={TTL_MAX}s for IP={ip_int} domain={domain}")
+            ttl = TTL_MAX
+        return ttl
 
-        timer = threading.Timer(ttl_seconds, cleanup)
-        timer.daemon = True
-        with self._timer_lock:
-            self._cleanup_timers.append(timer)
-        timer.start()
+    def _acquire_ip(self, ip_int, auth_id, ttl_seconds):
+        """Increment refcount; return True if this is the first active auth for this IP."""
+        with self._ip_refcount_lock:
+            entry = self._ip_refcount.get(ip_int)
+            if entry is None:
+                entry = {
+                    'auth_ids': set(),
+                    'max_expiry_ts': 0.0,
+                }
+                self._ip_refcount[ip_int] = entry
+            
+            is_first = len(entry['auth_ids']) == 0
+            if auth_id not in entry['auth_ids']:
+                entry['auth_ids'].add(auth_id)
+                log.debug(f"[DNS] IP {ip_int}: acquired by auth_id={auth_id}, refcount={len(entry['auth_ids'])}")
+            else:
+                log.debug(f"[DNS] IP {ip_int}: auth_id={auth_id} already active, refcount={len(entry['auth_ids'])}")
+            
+            entry['max_expiry_ts'] = max(entry['max_expiry_ts'], time.time() + ttl_seconds)
+            return is_first
+
+    def _release_ip(self, ip_int, auth_id):
+        """Decrement refcount; return True if this was the last active auth for this IP."""
+        with self._ip_refcount_lock:
+            entry = self._ip_refcount.get(ip_int)
+            if entry is None:
+                log.warning(f"[DNS] IP {ip_int}: release without acquire (auth_id={auth_id})")
+                return False
+                
+            entry['auth_ids'].discard(auth_id)
+            if entry['auth_ids']:
+                pending = [exp for (ip, aid), exp in self._pending_cleanups.items() if ip == ip_int and aid in entry['auth_ids']]
+                entry['max_expiry_ts'] = max(pending) if pending else 0.0
+                log.debug(f"[DNS] IP {ip_int}: released auth_id={auth_id}, refcount={len(entry['auth_ids'])}, next_expiry={entry['max_expiry_ts']:.1f}")
+                return False
+                
+            del self._ip_refcount[ip_int]
+            log.debug(f"[DNS] IP {ip_int}: last auth_id={auth_id} released, refcount=0")
+            return True
+
+    def _active_domains_for_ip(self, ip_int):
+        with self._ip_refcount_lock:
+            entry = self._ip_refcount.get(ip_int)
+            return sorted(entry['auth_ids']) if entry else []
+
+    def _schedule_drawbridge_cleanup(self, ip_int, ip_str, domain, ttl_seconds):
+        """Queue cleanup for a resolved IP instead of creating one timer per request."""
+        ttl_seconds = self._normalize_ttl(ttl_seconds, ip_int=ip_int, domain=domain)
+        auth_id = domain.lower()
+        expiry = time.time() + ttl_seconds
+        key = (ip_int, auth_id)
+        
+        with self._cleanup_lock:
+            if len(self._pending_cleanups) >= MAX_PENDING_CLEANUPS and key not in self._pending_cleanups:
+                log.error(f"[DNS] Cleanup queue full ({len(self._pending_cleanups)} pending), dropping cleanup for IP={ip_int} domain={domain}")
+                return
+            
+            old_expiry = self._pending_cleanups.get(key)
+            if old_expiry is None:
+                self._pending_cleanups[key] = expiry
+                log.debug(f"[DNS] Scheduled cleanup for IP={ip_int} domain={domain} expiry={expiry:.0f}")
+            elif expiry > old_expiry:
+                self._pending_cleanups[key] = expiry
+                log.debug(f"[DNS] Extended cleanup for IP={ip_int} domain={domain} {old_expiry:.0f}→{expiry:.0f}")
+            else:
+                log.debug(f"[DNS] Cleanup unchanged for IP={ip_int} domain={domain} existing={old_expiry:.0f} new={expiry:.0f}")
+                
+        self._acquire_ip(ip_int, auth_id, ttl_seconds)
+        self._cleanup_event.set()
+
+    def _cleanup_loop(self):
+        """Single background worker that expires pending cleanup entries."""
+        while not self._stop_event.is_set():
+            now = time.time()
+            expired = []
+            with self._cleanup_lock:
+                expired = [key for key, exp in self._pending_cleanups.items() if exp <= now]
+                for key in expired:
+                    del self._pending_cleanups[key]
+                next_expiry = min(self._pending_cleanups.values()) if self._pending_cleanups else None
+                
+            for ip_int, auth_id in expired:
+                if self._release_ip(ip_int, auth_id):
+                    active_domains = self._active_domains_for_ip(ip_int)
+                    log.info(f"[DNS] IP {ip_int}: rule removed after expiry for auth_id={auth_id}")
+                    try:
+                        self.ipc.remove_network_rule(ip_int)
+                    except Exception as e:
+                        log.error(f"[DNS] Failed to remove expired rule for IP {ip_int}: {e}")
+                else:
+                    active_domains = self._active_domains_for_ip(ip_int)
+                    log.debug(f"[DNS] IP {ip_int}: cleanup deferred, active domains={active_domains}")
+                    
+            wait_secs = CLEANUP_SLEEP_MAX
+            if next_expiry is not None:
+                wait_secs = max(0.1, min(CLEANUP_SLEEP_MAX, next_expiry - time.time()))
+                
+            self._cleanup_event.wait(timeout=wait_secs)
+            self._cleanup_event.clear()
 
     def _listen(self):
         while self.running:
@@ -87,7 +213,7 @@ class TelosDNSProxy:
     def _handle_request(self, data, addr):
         try:
             request = DNSRecord.parse(data)
-            qname = str(request.q.qname).rstrip('.')
+            qname = str(request.q.qname).rstrip('.').lower()
             qtype = QTYPE[request.q.qtype]
             
             log.debug(f"[DNS] Intercepted query: {qname} ({qtype})")
