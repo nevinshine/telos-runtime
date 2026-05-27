@@ -19,6 +19,7 @@ log = logging.getLogger('telos.dns')
 # TTL bounds for DNS-authorized firewall holes
 TTL_MIN = 60
 TTL_MAX = 3600
+# Bound the number of pending cleanup entries so the worker queue cannot grow without limit.
 MAX_PENDING_CLEANUPS = 10000
 CLEANUP_SLEEP_MAX = 1.0
 
