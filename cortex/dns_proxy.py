@@ -290,7 +290,8 @@ class TelosDNSProxy:
                     packed = socket.inet_aton(ip_str)
                     ip_int = struct.unpack("!I", packed)[0]
                     
-                    # Use DNS record TTL for drawbridge lifetime. Scheduler will normalize invalid values.
+                    # Use DNS record TTL for drawbridge lifetime.
+                    # Zero and invalid TTLs are normalized by the scheduler.
                     ttl_seconds = rr.ttl
 
                     # 🔥 THE DRAWBRIDGE 🔥
