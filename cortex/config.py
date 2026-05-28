@@ -30,6 +30,7 @@ class NetworkPolicy(BaseModel):
     default_action: str = Field(default="deny")
     always_allowed: List[str] = Field(default_factory=list)
     blocked: List[str] = Field(default_factory=list)
+    block_dns: List[str] = Field(default_factory=list)
 
 class FilesystemPolicy(BaseModel):
     sensitive_paths: List[str] = Field(min_length=1) # Required to have at least one

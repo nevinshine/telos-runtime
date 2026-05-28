@@ -124,6 +124,24 @@ struct {
   __type(value, __u32); // Taint level of the originator
 } tainted_ipc_map SEC(".maps");
 
+// [Phase 7] Task Storage for Taint
+// Stores taint directly on the kernel task_struct, auto-cleaned on exit
+struct {
+  __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, __u32); // Taint level
+} task_taint_storage SEC(".maps");
+
+// [Phase 7] Socket Storage for Taint
+// Stores taint directly on the kernel sock struct, auto-cleaned on close
+struct {
+  __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, __u32); // Taint level
+} sk_taint_storage SEC(".maps");
+
 // Define AF_INET if missing
 #ifndef AF_INET
 #define AF_INET 2
@@ -702,6 +720,99 @@ int BPF_PROG(telos_check_file_receive, struct file *file) {
   }
   
   return 0;
+}
+
+/*
+ * Phase 7: Deep Kernel Pivot - Cross-Process Taint Tracking
+ * Hook: unix_stream_connect
+ *
+ * Taints a UNIX domain socket when a tainted process initiates a connection.
+ */
+SEC("lsm/unix_stream_connect")
+int BPF_PROG(telos_check_unix_stream_connect, struct sock *sock, struct sock *other, struct sock *newsk) {
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+  __u32 *task_taint = bpf_task_storage_get(&task_taint_storage, task, 0, 0);
+
+  if (task_taint && *task_taint >= TAINT_HIGH) {
+    // Taint the server socket (other)
+    if (other) {
+      __u32 *server_taint = bpf_sk_storage_get(&sk_taint_storage, other, 0, BPF_SK_STORAGE_GET_F_CREATE);
+      if (server_taint) *server_taint = *task_taint;
+    }
+    
+    // Taint the newly spawned connection socket (newsk)
+    if (newsk) {
+      __u32 *conn_taint = bpf_sk_storage_get(&sk_taint_storage, newsk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+      if (conn_taint) *conn_taint = *task_taint;
+    }
+  } else {
+     // Check if we are connecting to a tainted server
+     if (other) {
+         __u32 *server_taint = bpf_sk_storage_get(&sk_taint_storage, other, 0, 0);
+         if (server_taint && *server_taint >= TAINT_HIGH) {
+             // Inherit taint to our task
+             __u32 *our_taint = bpf_task_storage_get(&task_taint_storage, task, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+             if (our_taint) *our_taint = *server_taint;
+             
+             // Update global map for Cortex visibility
+             __u32 pid = bpf_get_current_pid_tgid() >> 32;
+             struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+             if (info) {
+                 info->taint_level = *server_taint;
+                 bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+             } else {
+                struct process_info_t new_info = {};
+                new_info.pid = pid;
+                new_info.taint_level = *server_taint;
+                bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+                bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+             }
+             emit_event(pid, *server_taint, 0, "unix_conn_inh", 0);
+         }
+     }
+  }
+
+  return 0;
+}
+
+/*
+ * Phase 7: Hook: socket_sock_rcv_skb
+ *
+ * Inherits taint when a clean process receives a packet on a tainted socket.
+ * This effectively passes the taint from the socket layer to the task_struct.
+ */
+SEC("lsm/socket_sock_rcv_skb")
+int BPF_PROG(telos_check_socket_sock_rcv_skb, struct sock *sk, struct sk_buff *skb) {
+    if (!sk) return 0;
+    
+    // Check if the socket is tainted
+    __u32 *sk_taint = bpf_sk_storage_get(&sk_taint_storage, sk, 0, 0);
+    if (sk_taint && *sk_taint >= TAINT_HIGH) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+        __u32 *task_taint = bpf_task_storage_get(&task_taint_storage, task, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        
+        // Inherit the taint
+        if (task_taint && *task_taint < *sk_taint) {
+            *task_taint = *sk_taint;
+            
+            // Sync with global map
+            __u32 pid = bpf_get_current_pid_tgid() >> 32;
+            struct process_info_t *info = bpf_map_lookup_elem(&process_map, &pid);
+            if (info) {
+                 info->taint_level = *sk_taint;
+                 bpf_map_update_elem(&process_map, &pid, info, BPF_ANY);
+            } else {
+                 struct process_info_t new_info = {};
+                 new_info.pid = pid;
+                 new_info.taint_level = *sk_taint;
+                 bpf_get_current_comm(&new_info.comm, sizeof(new_info.comm));
+                 bpf_map_update_elem(&process_map, &pid, &new_info, BPF_ANY);
+            }
+            emit_event(pid, *sk_taint, 0, "socket_recv_inh", 0);
+        }
+    }
+    
+    return 0;
 }
 
 /*

@@ -6,7 +6,7 @@
 /*
  * Sentinel Stack: Static Analysis Limit PoC (Halting Problem)
  * 
- * This program mathematically proves the limits of static analysis and SMT solvers.
+ * This program formally demonstrates the limits of static analysis and SMT solvers.
  * It simulates a scenario where reachability of a memory safety violation (buffer overflow)
  * depends on an undecidable or computationally infeasible property (inverting a hash).
  * 
@@ -46,9 +46,9 @@ int main(int argc, char **argv) {
 
     uint32_t result = complex_hash(argv[1]);
 
-    // Magic Target: The SMT solver must mathematically invert the 'complex_hash'
+    // Magic Target: The SMT solver must formally invert the 'complex_hash'
     // to find an input that hashes to exactly 0xDEADBEEF.
-    // For real cryptographic hashes (SHA-256), this is mathematically infeasible.
+    // For real cryptographic hashes (SHA-256), this is formally infeasible.
     if (result == 0xDEADBEEF) {
         // The static analyzer cannot determine if this line is reachable.
         // It must assume UNKNOWN. Only a runtime layer can protect this.

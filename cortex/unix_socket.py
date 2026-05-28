@@ -414,4 +414,19 @@ class CoreIPCClient:
             log.error(f"Core: Failed to arm Mirage trap for inode {inode}: {error}")
             return False
 
+    # === Phase 7: Layer 7 DPI (Hyperion XDP) ===
+
+    def block_dns(self, domain: str) -> bool:
+        """Push a malicious DNS domain signature to the XDP engine."""
+        response = self._send_command('BLOCK_DNS', {
+            'domain': domain
+        })
+        
+        if response and response.get('success'):
+            log.info(f"Core: XDP DNS Blocklist armed for '{domain}'")
+            return True
+        else:
+            error = response.get('error', 'Unknown error') if response else 'No response'
+            log.error(f"Core: Failed to arm DNS blocklist for '{domain}': {error}")
+            return False
 

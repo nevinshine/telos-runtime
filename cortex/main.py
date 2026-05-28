@@ -758,6 +758,16 @@ def sync_network_policy(config: dict, ipc: CoreIPCClient):
             
     log.info(f"✓ Allowed {count} network destinations")
 
+def sync_dns_policy(policy_data: dict, ipc: CoreIPCClient):
+    """Parse L7 DNS signatures and push to Hyperion XDP."""
+    dns_blocks = policy_data.get('network_policy', {}).get('block_dns', [])
+    count = 0
+    for domain in dns_blocks:
+        if ipc.block_dns(domain):
+            count += 1
+    if count > 0:
+        log.info(f"✓ Armed {count} Layer 7 DNS XDP Signatures")
+
 
 # === MAIN ===
 
@@ -811,6 +821,7 @@ def main():
     # Sync policies silently
     sync_filesystem_policy(server.policy, server.ipc) 
     sync_network_policy(server.policy, server.ipc)
+    sync_dns_policy(server.policy, server.ipc)
 
     # Restore logging for runtime
     root_logger.setLevel(sync_level)

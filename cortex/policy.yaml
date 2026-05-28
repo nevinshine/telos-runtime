@@ -42,6 +42,12 @@ network:
     - "attacker.com"
     - "evil.net"
     - "*.onion"
+  
+  # Layer 7 DNS Signatures (XDP DPI)
+  block_dns:
+    - "evil.com"
+    - "c2.malware.local"
+    - "exfiltrate.io"
 
 # === FILESYSTEM POLICY ===
 filesystem:
