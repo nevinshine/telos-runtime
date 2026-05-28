@@ -978,10 +978,12 @@ func (d *TelosDaemon) readEvents() {
 
 		if event.DescStr == "connect_denied" || event.DescStr == "exfil_blocked" {
 			ip := make(net.IP, 4)
-			binary.BigEndian.PutUint32(ip, uint32(event.ContextVal))
+			binary.LittleEndian.PutUint32(ip, uint32(event.ContextVal))
 			targetContext = ip.String()
 		} else if event.DescStr == "open_inode" || event.DescStr == "mirage_trap" {
 			targetContext = fmt.Sprintf("inode:%d", event.ContextVal)
+		} else if event.DescStr == "ptrace_denied" {
+			targetContext = fmt.Sprintf("pid:%d", event.ContextVal)
 		}
 
 		d.EmitAudit(SentinelAuditEvent{
