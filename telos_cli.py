@@ -12,6 +12,14 @@ import time
 import signal
 import subprocess
 import shutil
+import tempfile
+import errno
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+import stat
 
 from pathlib import Path
 
@@ -40,8 +48,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_DIR / "logs"
 DAEMON_LOG = LOG_DIR / "telos_daemon.log"
 CORTEX_LOG = LOG_DIR / "telos_cortex.log"
-DAEMON_PID_FILE = Path("/tmp/telos_daemon.pid")
-CORTEX_PID_FILE = Path("/tmp/telos_cortex.pid")
+DAEMON_PID_FILE = Path("/var/run/telos_daemon.pid")
+CORTEX_PID_FILE = Path("/var/run/telos_cortex.pid")
+TUI_PID_FILE = Path("/var/run/telos_tui.pid")
 BPF_PIN_PATH = Path("/sys/fs/bpf/telos")
 
 # ── Palette (Lipgloss-inspired) ──────────────────────────────────────────────
@@ -98,15 +107,113 @@ def print_header():
 # ── Process Helpers ──────────────────────────────────────────────────────────
 
 def pid_alive(pid_file: Path) -> int | None:
-    """Return PID if alive, None otherwise."""
-    if not pid_file.exists():
+    """Return PID if alive, None otherwise (uses safe read semantics)."""
+    pid = secure_read_pid(pid_file)
+    if not pid:
         return None
     try:
-        pid = int(pid_file.read_text().strip())
         os.kill(pid, 0)
         return pid
-    except (ValueError, ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError):
         return None
+
+
+def secure_write_pid(pid_file: Path, pid: int) -> None:
+    """Atomically write PID file to `pid_file` with best-effort safety checks.
+
+    - Writes to a temp file in the same directory and uses os.replace() to atomically
+      install the new pidfile.
+    - Ensures data is fsynced before rename.
+    - Falls back to a normal write on platforms that lack required syscalls.
+    """
+    parent = pid_file.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        tf = tempfile.NamedTemporaryFile(mode="w", dir=str(parent), delete=False)
+        tmp = Path(tf.name)
+        tf.write(f"{pid}\n")
+        tf.flush()
+        try:
+            os.fsync(tf.fileno())
+        except Exception:
+            pass
+        tf.close()
+        # Atomic replace
+        os.replace(str(tmp), str(pid_file))
+    finally:
+        try:
+            if tmp and tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def secure_read_pid(pid_file: Path) -> int | None:
+    """Safely read a PID from `pid_file`.
+
+    Best-effort protections:
+    - Reject symlinks when possible.
+    - Use O_NOFOLLOW when available to open without following symlinks.
+    - Verify file ownership matches current effective user or root.
+    - Optionally use flock when available to avoid races.
+    """
+    if not pid_file.exists():
+        return None
+    # Prefer low-level open with O_NOFOLLOW on platforms that support it
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(pid_file), flags)
+    except OSError as e:
+        # If the file is a symlink or O_NOFOLLOW not supported, fall back
+        try:
+            st = pid_file.lstat()
+            if st and stat.S_ISLNK(st.st_mode):
+                return None
+        except Exception:
+            pass
+        try:
+            return int(pid_file.read_text().strip())
+        except Exception:
+            return None
+
+    try:
+        # Optionally lock for shared read
+        if fcntl:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            except Exception:
+                pass
+        stat_res = os.fstat(fd)
+        try:
+            euid = os.geteuid()
+        except Exception:
+            euid = None
+        # If we can check ownership, ensure it's either owned by us or root
+        if euid is not None:
+            if stat_res.st_uid != euid and stat_res.st_uid != 0:
+                return None
+        data = os.read(fd, 128)
+        try:
+            pid = int(data.decode().strip())
+            return pid
+        except Exception:
+            return None
+    finally:
+        try:
+            if fcntl:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
 
 
 def run_step(cmd: str, cwd: str = str(PROJECT_DIR)) -> bool:
@@ -168,7 +275,7 @@ def cmd_start(extra_args: list[str]):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        DAEMON_PID_FILE.write_text(str(proc.pid))
+        secure_write_pid(DAEMON_PID_FILE, proc.pid)
         daemon_pid = proc.pid
     
     # Give daemon a tiny moment to bind socket
@@ -200,7 +307,7 @@ def cmd_start(extra_args: list[str]):
             start_new_session=True,
             env=env,
         )
-        CORTEX_PID_FILE.write_text(str(proc.pid))
+        secure_write_pid(CORTEX_PID_FILE, proc.pid)
         cortex_pid = proc.pid
     ms = int((time.time() - start_t) * 1000)
     console.print(f"[{DARK_GRAY}]│[/]")
@@ -370,7 +477,7 @@ def cmd_status():
         )
 
     # Dashboard
-    dash_running = pid_alive(Path("/tmp/telos_tui.pid"))
+    dash_running = pid_alive(TUI_PID_FILE)
     if dash_running:
         table.add_row(
             "Terminal UI",
@@ -467,12 +574,16 @@ def cmd_dash():
             console.print(f"  [{RED}]✕[/]  Failed to build TUI")
             sys.exit(1)
 
-    # Write PID so status can find it, though it's foreground
-    Path("/tmp/telos_tui.pid").write_text(str(os.getpid()))
+    # Write PID so status can find it, though it's foreground.
+    # If /var/run is not writable (e.g. direct non-root launch), keep running.
+    try:
+        secure_write_pid(TUI_PID_FILE, os.getpid())
+    except OSError as err:
+        console.print(f"  [{YELLOW}]●[/]  [white]Could not write TUI PID file[/] [{DIM}]{err}[/]")
     try:
         os.execv(str(tui_bin), [str(tui_bin)])
     finally:
-        Path("/tmp/telos_tui.pid").unlink(missing_ok=True)
+        TUI_PID_FILE.unlink(missing_ok=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
