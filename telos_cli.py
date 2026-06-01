@@ -167,17 +167,14 @@ def secure_read_pid(pid_file: Path) -> int | None:
             flags |= os.O_NOFOLLOW
         fd = os.open(str(pid_file), flags)
     except OSError as e:
-        # If the file is a symlink or O_NOFOLLOW not supported, fall back
+        # If the file is a symlink or O_NOFOLLOW not supported, reject it
         try:
             st = pid_file.lstat()
             if st and stat.S_ISLNK(st.st_mode):
                 return None
         except Exception:
             pass
-        try:
-            return int(pid_file.read_text().strip())
-        except Exception:
-            return None
+        return None
 
     try:
         # Optionally lock for shared read

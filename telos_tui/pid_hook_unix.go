@@ -9,10 +9,10 @@ import (
 )
 
 // preInstallHook performs ownership validation and acquires an exclusive flock on the
-// target PID file (creating it if necessary). It returns a cleanup function that
+// temporary PID file before renaming it to the final path. It returns a cleanup function that
 // releases the lock and closes the file, or an error.
-func preInstallHook(_tmpName, path string) (func() error, error) {
-	// Reject symlink targets
+func preInstallHook(tmpName, path string) (func() error, error) {
+	// Reject existing symlink targets
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("pidfile target is a symlink")
@@ -26,13 +26,13 @@ func preInstallHook(_tmpName, path string) (func() error, error) {
 		}
 	}
 
-	// Open (or create) the target file so we can lock it
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	// Open the temporary file to lock it before rename
+	f, err := os.OpenFile(tmpName, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	// Acquire exclusive lock
+	// Acquire exclusive lock on tmpName
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		f.Close()
 		return nil, err

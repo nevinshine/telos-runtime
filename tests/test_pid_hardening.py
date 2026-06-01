@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 import os
 
 
@@ -25,9 +26,10 @@ class PidFileHardeningTest(unittest.TestCase):
             td = pathlib.Path(td)
             pid_file = td / "telos_daemon.pid"
 
-            # Legitimate writer should be accepted
+            # Legitimate writer should be accepted (patch os.kill to avoid ProcessLookupError for dummy PID)
             telos_cli.secure_write_pid(pid_file, 424242)
-            self.assertEqual(telos_cli.pid_alive(pid_file), 424242)
+            with unittest.mock.patch('os.kill', return_value=None):
+                self.assertEqual(telos_cli.pid_alive(pid_file), 424242)
 
             # Now create a forged pid target and replace with a symlink
             forged = td / "forged.pid"
