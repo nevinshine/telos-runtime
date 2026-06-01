@@ -150,6 +150,8 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
         self.rate_limiter = RateLimiter()
         self._exec_expiries = {}
         self._exec_expiries_lock = threading.Lock()
+        self._pid_locks: Dict[int, threading.Lock] = {}
+        self._pid_locks_guard = threading.Lock()
         log.info("TelosControlService initialized")
 
     def _validate_pid(
@@ -183,7 +185,14 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                 grpc.StatusCode.PERMISSION_DENIED,
                 f"session {session_id!r} is already bound to PID {mapped_pid}",
             )
-    
+
+    def _get_pid_lock(self, pid: int) -> threading.Lock:
+        """Return a stable per-PID lock to serialize the taint-check → exec-write commit."""
+        with self._pid_locks_guard:
+            if pid not in self._pid_locks:
+                self._pid_locks[pid] = threading.Lock()
+            return self._pid_locks[pid]
+
     def ReportTaint(self, request: protocol_pb2.TaintReport, 
                     context: grpc.ServicerContext) -> protocol_pb2.Ack:
         """
@@ -325,18 +334,71 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
             exec_actions
         )
 
+        pid_lock = self._get_pid_lock(request.agent_pid)
+
+        with pid_lock:
+            try:
+                current_taint = self.ipc.get_pid_taint_level(request.agent_pid)
+
+                if current_taint is not None:
+                    self.guardian.update_core_taint(
+                        request.agent_pid,
+                        current_taint
+                    )
+
+                    if current_taint >= protocol_pb2.TaintLevel.HIGH:
+                        log.warning(
+                            "[Intent] Denied after verification: PID %d tainted during verification (%d)",
+                            request.agent_pid,
+                            current_taint,
+                        )
+                        self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                        return protocol_pb2.IntentVerdict(
+                            allowed=False,
+                            reason="Agent taint escalated during verification.",
+                            policy_ttl_ms=1000,
+                        )
+
+            except Exception as e:
+                log.warning(
+                    "[Intent] Final taint re-check failed for PID %d: %s",
+                    request.agent_pid,
+                    e,
+                )
+                self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                return protocol_pb2.IntentVerdict(
+                    allowed=False,
+                    reason="Final taint verification failed.",
+                    policy_ttl_ms=1000,
+                )
+
+            # Commit exec policy atomically — inside lock so no two threads
+            # can interleave taint-check and exec-write for the same PID.
+            if allowed:
+                if allowed_bins:
+                    self.ipc.send_update_exec(request.agent_pid, allowed_bins, mode=1)
+                    log.info(f"🛡 Exec Drawbridge locked to: {allowed_bins}")
+            else:
+                if exec_actions:
+                    self.ipc.send_update_exec(request.agent_pid, [], mode=1)
+                    log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
+
+            # Register agent and session inside lock — atomic with exec policy write
+            self.guardian.register_agent(request.agent_pid)
+            if request.session_id:
+                self.guardian.register_session(request.session_id, request.agent_pid)
+
+        # Side effects — timers and network rules go outside the lock.
+        # These are not exec-policy-critical and do not need serialization.
         if allowed:
             log.info(f"✅ Intent APPROVED: {reason}")
-            
-            # [PHASE 5: Intent-Based Execution]
+
             if allowed_bins:
-                self.ipc.send_update_exec(request.agent_pid, allowed_bins, mode=1)
-                log.info(f"🛡 Exec Drawbridge locked to: {allowed_bins}")
-                
-                # Schedule Cleanup Timer
                 expected_expiry = time.time() + (ttl_ms / 1000.0)
                 with self._exec_expiries_lock:
-                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+                    self._exec_expiries[request.agent_pid] = max(
+                        self._exec_expiries.get(request.agent_pid, 0), expected_expiry
+                    )
 
                 def cleanup_exec(pid=request.agent_pid):
                     with self._exec_expiries_lock:
@@ -347,53 +409,46 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                         log.info(f"🔓 Exec Drawbridge released for PID {pid}")
                     except Exception:
                         pass
-                    
+
                 timer_exec = threading.Timer(ttl_ms / 1000.0, cleanup_exec)
                 timer_exec.daemon = True
                 timer_exec.start()
 
             # [PHASE 3: Intent-Based Networking]
             for domain in domains:
-                # 1. Authorize domain in DNS Proxy (Phase 4)
                 self.dns.allow_domain(domain, ttl_ms)
-                
-                # 2. Resolve domain to IP (Simple for Phase 3 MVP)
                 try:
                     addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
                     for _, _, _, _, sockaddr in addr_info:
                         ip_str = sockaddr[0]
                         packed = socket.inet_aton(ip_str)
                         ip_int = struct.unpack("!I", packed)[0]
-                        
-                        # 3. Push to Kernel Map
+
                         if self.ipc.add_network_rule(ip_int):
                             log.info(f"🌐 Drawbridge lowered for {domain} ({ip_str})")
-                            
-                            # 4. Schedule Cleanup Timer
+
                             def cleanup(ip_to_remove=ip_int, domain_name=domain):
                                 try:
                                     self.ipc.remove_network_rule(ip_to_remove)
                                     log.info(f"🔒 Drawbridge raised for {domain_name}")
                                 except Exception:
                                     pass
-                                
+
                             timer = threading.Timer(ttl_ms / 1000.0, cleanup)
                             timer.daemon = True
                             timer.start()
                 except Exception as e:
                     log.warning(f"Failed to resolve/allow domain {domain} for IPC: {e}")
-                
+
         else:
             log.warning(f"❌ Intent DENIED: {reason}")
-            # [PHASE 5: Intent-Based Execution]
+
             if exec_actions:
-                self.ipc.send_update_exec(request.agent_pid, [], mode=1)
-                log.info(f"🚫 Exec Drawbridge locked COMPLETELY for PID {request.agent_pid}")
-                
-                # Release after TTL
                 expected_expiry = time.time() + 10.0
                 with self._exec_expiries_lock:
-                    self._exec_expiries[request.agent_pid] = max(self._exec_expiries.get(request.agent_pid, 0), expected_expiry)
+                    self._exec_expiries[request.agent_pid] = max(
+                        self._exec_expiries.get(request.agent_pid, 0), expected_expiry
+                    )
 
                 def cleanup_deny(pid=request.agent_pid):
                     with self._exec_expiries_lock:
@@ -404,18 +459,11 @@ class TelosControlService(protocol_pb2_grpc.TelosControlServicer):
                         log.info(f"🔓 Exec Drawbridge released for PID {pid}")
                     except Exception:
                         pass
-                    
-                timer_deny = threading.Timer(10.0, cleanup_deny)  # 10s penalty box
+
+                timer_deny = threading.Timer(10.0, cleanup_deny)
                 timer_deny.daemon = True
                 timer_deny.start()
-        
-        # Register this agent if not already known
-        self.guardian.register_agent(request.agent_pid)
-        
-        # [NEW] Register Session ID if provided
-        if request.session_id:
-            self.guardian.register_session(request.session_id, request.agent_pid)
-        
+
         return protocol_pb2.IntentVerdict(
             allowed=allowed,
             reason=reason,
