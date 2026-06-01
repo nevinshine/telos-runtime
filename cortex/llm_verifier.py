@@ -106,7 +106,7 @@ class LLMVerifier:
 
     @property
     def is_available(self):
-        return self.model is not None
+        return self.model is not None or "OPENAI_API_KEY" in os.environ
 
     @lru_cache(maxsize=1024)
     def _cached_verify(self, goal, domain):
@@ -123,8 +123,34 @@ class LLMVerifier:
 
     def _infer(self, goal, domain):
         prompt = FEW_SHOT_PROMPT.format(goal=goal, domain=domain)
-
         start_time = time.time()
+
+        if self.model is None and "OPENAI_API_KEY" in os.environ:
+            import requests
+            headers = {
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 5,
+                "temperature": 0.0
+            }
+            try:
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=10)
+                r.raise_for_status()
+                result = r.json()
+                text = result["choices"][0]["message"]["content"].strip().upper()
+                latency = time.time() - start_time
+                is_allowed = "RELEVANT" in text
+                verdict = "ALLOW" if is_allowed else "DENY"
+                log.info("[LLM-OpenAI] %s -> %s: %s [%.0fms]", goal, domain, verdict, latency * 1000)
+                return is_allowed, f"Cognitive(OpenAI): domain is {'relevant' if is_allowed else 'NOT relevant'} to goal"
+            except Exception as e:
+                log.error("OpenAI API failed: %s", e)
+                return False, "Cognitive(OpenAI): API failure (fail-closed)"
+
         response = self.model(
             prompt,
             max_tokens=3,
