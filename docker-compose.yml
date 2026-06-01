@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  telos-runtime:
+    build: .
+    privileged: true
+    pid: "host"
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+    network_mode: "host"
