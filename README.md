@@ -178,6 +178,20 @@ pip install -r cortex/requirements.txt
 ./scripts/download_model.sh
 ```
 
+### Building and Installing Telos
+
+Build the eBPF programs and Go components:
+
+```bash
+make all
+```
+
+Install the `telos` CLI globally:
+
+```bash
+sudo make install
+```
+
 ### Running Telos
 
 ```bash
