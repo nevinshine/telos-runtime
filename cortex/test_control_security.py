@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for Cortex control-plane hardening."""
 
+import time
+import threading
 import os
 import sys
 import unittest
@@ -123,6 +125,62 @@ class CortexControlSecurityTests(unittest.TestCase):
         self.assertEqual(ipc.registered, [])
         self.assertFalse(service.guardian.has_agent(999999))
 
+class CortexTOCTOURaceTests(unittest.TestCase):
+
+    def test_taint_escalation_during_verify_is_caught_by_recheck(self):
+        """
+        If taint escalates to HIGH while verify() is running,
+        the re-check inside the pid_lock must block the exec policy install.
+        This is the actual TOCTOU scenario from issue #104.
+        """
+        install_count = []
+        install_lock = threading.Lock()
+        call_count = [0]
+        call_count_lock = threading.Lock()
+
+        class CountingIPC(FakeIPC):
+            def send_update_exec(self, pid, allowed_bins, mode=1):
+                with install_lock:
+                    if allowed_bins:
+                        install_count.append((pid, tuple(allowed_bins), mode))
+                return True
+
+            def get_pid_taint_level(self, pid):
+                with call_count_lock:
+                    call_count[0] += 1
+                    # First call = pre-verify early check → clean
+                    # Second call = re-check inside lock → taint escalated
+                    if call_count[0] <= 1:
+                        return 0
+                    return protocol_pb2.TaintLevel.HIGH
+
+        class SlowVerifier(FakeVerifier):
+            def verify(self, pid, goal, planned_actions, exec_actions):
+                time.sleep(0.05)  # simulate taint escalating during this window
+                return True, "ok", 1000, [], ["curl"]
+
+        service = TelosControlService(
+            Guardian({}), CountingIPC(), SlowVerifier(), FakeDNSProxy()
+        )
+        pid = os.getpid()
+        request = protocol_pb2.IntentRequest(
+            agent_pid=pid,
+            natural_language_goal="download file",
+            planned_exec_actions=["curl http://example.com"],
+        )
+
+        with mock.patch("cortex.main._pid_exists", return_value=True):
+            verdict = service.DeclareIntent(request, FakeContext())
+
+        # Intent must be denied because taint escalated during verify()
+        self.assertFalse(verdict.allowed)
+        self.assertIn("escalated", verdict.reason.lower())
+
+        # No exec policy must have been installed
+        self.assertEqual(
+            len(install_count), 0,
+            f"Exec policy was installed despite taint escalation: {install_count}"
+        )
 
 if __name__ == "__main__":
     unittest.main()
