@@ -129,6 +129,12 @@ install_deps:
 	@echo "Installing Python dependencies..."
 	pip install -r cortex/requirements.txt
 
+uninstall:
+	@echo "Uninstalling TELOS Runtime..."
+	rm -f /var/run/telos.sock
+	rm -f ~/.config/google-chrome/NativeMessagingHosts/com.telos.browser.json
+	@echo "✓ Uninstall complete. Note: Python dependencies installed via pip were not removed."
+
 # === TEST TARGETS ===
 
 test: test_loader
