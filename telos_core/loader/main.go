@@ -14,6 +14,8 @@
 
 package main
 
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel hyperionBpf ../src/hyperion_core.c -- -I../src -D__TARGET_ARCH_x86
+
 import (
 	"bufio"
 	"bytes"
