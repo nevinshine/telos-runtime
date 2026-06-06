@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 const (
 	EventsSocket = "/var/run/telos_events.sock"
 	CortexLog    = "/tmp/telos_cortex.log"
+	PIDFile      = "/var/run/telos_tui.pid"
 )
 
 // --- COLORS (Cyber-Grid Theme) ---
@@ -124,6 +127,12 @@ type cortexMsg string
 type tickMsg time.Time
 
 func main() {
+	if err := writePIDFile(PIDFile, os.Getpid()); err != nil {
+		log.Printf("warning: unable to write TUI PID file %s: %v", PIDFile, err)
+	} else {
+		defer os.Remove(PIDFile)
+	}
+
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(cBrand)
@@ -151,6 +160,63 @@ func main() {
 		log.Fatal(err)
 		os.Exit(1)
 	}
+}
+
+// writePIDFile atomically writes pid to path. It creates a temp file in the same
+// directory, fsyncs, and renames it into place. It rejects existing symlink targets
+// and performs an ownership check when possible.
+func writePIDFile(path string, pid int) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	// Ensure target isn't a symlink
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("pidfile target is a symlink")
+		}
+	}
+
+	tmp, err := os.CreateTemp(dir, "telos-pid-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}()
+
+	if _, err := io.WriteString(tmp, fmt.Sprintf("%d\n", pid)); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		// try to continue even if fsync fails
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	// Perform platform-specific pre-install hook (ownership check / flock)
+	cleanup, err := preInstallHook(tmpName, path)
+	if err != nil {
+		return err
+	}
+	// Final atomic install
+	if err := os.Rename(tmpName, path); err != nil {
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		return err
+	}
+
+	if cleanup != nil {
+		if err := cleanup(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- System Info Helpers ---
