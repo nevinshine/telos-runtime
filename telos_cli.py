@@ -250,6 +250,21 @@ def cmd_start(extra_args: list[str]):
     console.print(summary)
     console.print()
 
+def stop_process_group(pid: int, timeout: int = 1):
+    try:
+        pgid = os.getpgid(pid)
+
+        os.killpg(pgid, signal.SIGTERM)
+        time.sleep(timeout)
+
+        try:
+            os.killpg(pgid, 0)
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    except ProcessLookupError:
+        pass
 
 # ── Stop Command ─────────────────────────────────────────────────────────────
 
@@ -265,13 +280,8 @@ def cmd_stop():
     start_t = time.time()
     cortex_pid = pid_alive(CORTEX_PID_FILE)
     if cortex_pid:
-        os.kill(cortex_pid, signal.SIGTERM)
-        time.sleep(1)
-        try:
-            os.kill(cortex_pid, 0)
-            os.kill(cortex_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        stop_process_group(cortex_pid, 1)
+    
     CORTEX_PID_FILE.unlink(missing_ok=True)
     ms = int((time.time() - start_t) * 1000)
     console.print(f"[{DARK_GRAY}]│[/]")
@@ -281,17 +291,19 @@ def cmd_stop():
     start_t = time.time()
     daemon_pid = pid_alive(DAEMON_PID_FILE)
     if daemon_pid:
-        os.kill(daemon_pid, signal.SIGTERM)
-        time.sleep(2)
-        try:
-            os.kill(daemon_pid, 0)
-            os.kill(daemon_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        stop_process_group(daemon_pid, 2)
         console.print(f"  [{GREEN}]●[/]  [white]Daemon stopped[/]  [{DIM}]PID: {daemon_pid}[/]")
     else:
         console.print(f"  [{YELLOW}]●[/]  [white]Daemon[/]  [{DIM}]not running[/]")
     DAEMON_PID_FILE.unlink(missing_ok=True)
+
+    # Stop Dashboard
+    dash_pid = pid_alive(Path("/tmp/telos_tui.pid"))
+
+    if dash_pid:
+        stop_process_group(dash_pid, 1)
+        console.print(f"  [{GREEN}]●[/]  [white]Dashboard stopped[/]  [{DIM}]PID: {dash_pid}[/]")
+    Path("/tmp/telos_tui.pid").unlink(missing_ok=True)
 
     # Cleanup BPF
     if BPF_PIN_PATH.exists():
