@@ -32,7 +32,7 @@ MODEL_CANDIDATES = [
 
 # Confidence threshold: if P(IRRELEVANT)/P(RELEVANT) > this ratio, deny.
 # Lower = more strict. 0.25 means IR only needs 25% as much probability as RE to trigger deny.
-DENY_THRESHOLD = 0.25
+DENY_THRESHOLD = float(os.environ.get("TELOS_LLM_DENY_THRESHOLD", "0.25"))
 
 FEW_SHOT_PROMPT = """Classify if a network domain is relevant to a user goal. Answer RELEVANT or IRRELEVANT.
 
