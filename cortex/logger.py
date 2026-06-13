@@ -1,5 +1,6 @@
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import structlog
 from contextvars import ContextVar
 import uuid
@@ -26,7 +27,7 @@ def setup_logging(log_path: str = "/var/log/telos/cortex.log"):
         level=logging.INFO,
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_path)
+            RotatingFileHandler(log_path, maxBytes=10*1024*1024, backupCount=5)
         ],
     )
     
