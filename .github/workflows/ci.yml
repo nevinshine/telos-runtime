@@ -86,6 +86,33 @@ jobs:
       - name: Validate eBPF build
         run: ./scripts/ci/build_ebpf.sh
 
+  stress-test:
+    name: stress-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libbpf-dev linux-libc-dev llvm linux-tools-common
+          sudo apt-get install -y --no-install-recommends bpftool || true
+          sudo apt-get install -y --no-install-recommends linux-bpf-dev || true
+          if ! sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)"; then
+            sudo apt-get install -y --no-install-recommends linux-tools-generic
+          fi
+
+      - name: Build and Run Stress Test
+        run: |
+          make all
+          sudo chmod +x ./tests/stress_map_cleanup.sh
+          sudo ./tests/stress_map_cleanup.sh
+
   ci-required:
     name: ci-required
     runs-on: ubuntu-latest
@@ -94,15 +121,18 @@ jobs:
       - lint
       - test
       - ebpf-build
+      - stress-test
     steps:
       - name: Assert required CI jobs passed
         run: |
           echo "lint result: ${{ needs.lint.result }}"
           echo "test result: ${{ needs.test.result }}"
           echo "ebpf-build result: ${{ needs.ebpf-build.result }}"
+          echo "stress-test result: ${{ needs.stress-test.result }}"
 
           if [ "${{ needs.lint.result }}" != "success" ] || \
              [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.stress-test.result }}" != "success" ] || \
              [ "${{ needs.ebpf-build.result }}" != "success" ]; then
             echo "At least one required CI job failed."
             exit 1
