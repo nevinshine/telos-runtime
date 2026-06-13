@@ -9,8 +9,10 @@ __pycache__/
 
 # eBPF Generated
 vmlinux.h
-*_bpf.o
-*_bpf.go
+!*bpfel.o
+!*bpfeb.o
+!*bpfel.go
+!*bpfeb.go
 
 # Credentials & Secrets
 .env

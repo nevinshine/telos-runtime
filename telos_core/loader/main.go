@@ -14,6 +14,8 @@
 
 package main
 
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel hyperionBpf ../src/hyperion_core.c -- -I../src -D__TARGET_ARCH_x86
+
 import (
 	"bufio"
 	"bytes"
@@ -260,6 +262,14 @@ var (
 		},
 		[]string{"map"},
 	)
+
+	metricEnforcementEvents = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sentinel_enforcement_events_total",
+			Help: "Aggregate runtime enforcement events grouped by category",
+		},
+		[]string{"category"},
+	)
 )
 
 func init() {
@@ -272,9 +282,15 @@ func init() {
 	prometheus.MustRegister(metricEbpfEvents)
 	prometheus.MustRegister(metricHeciBlocks)
 	prometheus.MustRegister(metricMapUtilization)
+	prometheus.MustRegister(metricEnforcementEvents)
 	metricMapUtilization.WithLabelValues("process_map").Set(0)
 	metricMapUtilization.WithLabelValues("network_map").Set(0)
 	metricMapUtilization.WithLabelValues("inode_map").Set(0)
+	metricEnforcementEvents.WithLabelValues("connect_denied").Add(0)
+	metricEnforcementEvents.WithLabelValues("exfil_blocked").Add(0)
+	metricEnforcementEvents.WithLabelValues("ptrace_denied").Add(0)
+	metricEnforcementEvents.WithLabelValues("open_inode").Add(0)
+	metricEnforcementEvents.WithLabelValues("mirage_trap").Add(0)
 }
 
 func NewTelosDaemon(socketPath, bpfObjPath string) *TelosDaemon {
@@ -946,6 +962,26 @@ func (d *TelosDaemon) readEvents() {
 
 		// Global Event Counter
 		metricEbpfEvents.Inc()
+
+		switch event.DescStr {
+		case "connect_denied":
+			metricEnforcementEvents.WithLabelValues("connect_denied").Inc()
+
+		case "connect_ipv6_denied":
+			metricEnforcementEvents.WithLabelValues("connect_denied").Inc()
+
+		case "exfil_blocked":
+			metricEnforcementEvents.WithLabelValues("exfil_blocked").Inc()
+
+		case "ptrace_denied":
+			metricEnforcementEvents.WithLabelValues("ptrace_denied").Inc()
+
+		case "open_inode":
+			metricEnforcementEvents.WithLabelValues("open_inode").Inc()
+
+		case "mirage_trap":
+			metricEnforcementEvents.WithLabelValues("mirage_trap").Inc()
+		}
 
 		// [Phase 12: Action Counting]
 		if event.Blocked == 1 {
