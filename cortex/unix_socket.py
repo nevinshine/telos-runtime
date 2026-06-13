@@ -65,7 +65,7 @@ class _ConnectionSlot:
             self._handle_failure(now)
             return False
         except Exception as e:
-            log.error(f"[slot {self.slot_id}] Connection failed: {e}")
+            log.exception(f"[slot {self.slot_id}] Connection failed: {e}")
             self._handle_failure(now)
             return False
 
@@ -124,7 +124,7 @@ class _ConnectionSlot:
             log.error(f"[slot {self.slot_id}] Invalid JSON: {e}")
             return None
         except Exception as e:
-            log.error(f"[slot {self.slot_id}] IPC error: {e}")
+            log.exception(f"[slot {self.slot_id}] IPC error: {e}")
             self.disconnect()
             return None
 
@@ -244,7 +244,7 @@ class CoreIPCClient:
             log.error(f"IPC pool error: {e}")
             return None
         except Exception as e:
-            log.error(f"_send_command unexpected error: {e}")
+            log.exception(f"_send_command unexpected error: {e}")
             return None
     
     # === PUBLIC COMMANDS ===
