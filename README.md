@@ -168,10 +168,12 @@ When the Domain Intelligence Engine denies a domain, Telos resolves the underlyi
 ### Installation
 
 ```bash
-git clone https://github.com/nevinshine/telos-runtime.git
+git clone [https://github.com/nevinshine/telos-runtime.git](https://github.com/nevinshine/telos-runtime.git)
 cd telos-runtime
 
-# Install Python dependencies
+# Create a virtual environment and install Python dependencies
+python3 -m venv venv
+source venv/bin/activate
 pip install -r cortex/requirements.txt
 
 # (Optional) Download the LLM model for control-plane escalation
