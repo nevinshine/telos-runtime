@@ -14,6 +14,20 @@ Telos is a Linux kernel-level security runtime that enforces AI agent behavior t
 
 ---
 
+## Latest Validation — Phase 2.3.2: Child Cgroup Identity
+
+Fedora 45 runtime testing successfully compiled and loaded the diagnostic eBPF
+object, attached `tp_btf/task_newtask` and `tp_btf/sched_process_fork`, and
+collected ring-buffer events. Ordinary fork reported parent and child cgroup
+IDs of `7294`; `CLONE_INTO_CGROUP` reported parent cgroup ID `7294` and child
+cgroup ID `7314`.
+
+This validates the diagnostic child-task identity mechanism only, **not
+production Telos LSM enforcement or production readiness**. See
+[the runtime validation report](docs/phase2-child-cgroup-runtime-validation.md).
+
+---
+
 ## What is Telos? (The Simple Version)
 
 Imagine your computer is a high-security building. Usually, if an employee (a program) has an ID badge, they can walk anywhere — into the vault, out the front door, or to the filing cabinets.
